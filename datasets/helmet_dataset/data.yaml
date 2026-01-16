@@ -1,0 +1,6 @@
+gggggtrain: images/train
+val: images/train
+
+names:
+  0: helmet
+  1: no_helmet

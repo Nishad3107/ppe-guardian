@@ -1,0 +1,24 @@
+
+<annotation>
+    <folder>images</folder>
+    <filename>hard_hat_workers4591.png</filename>
+    <size>
+        <width>415</width>
+        <height>416</height>
+        <depth>3</depth>
+    </size>
+    <segmented>0</segmented>
+    <object>
+        <name>helmet</name>
+        <pose>Unspecified</pose>
+        <truncated>0</truncated>
+        <occluded>0</occluded>
+        <difficult>0</difficult>
+        <bndbox>
+            <xmin>136</xmin>
+            <ymin>138</ymin>
+            <xmax>177</xmax>
+            <ymax>184</ymax>
+        </bndbox>
+    </object>
+</annotation>

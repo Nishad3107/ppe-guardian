@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>AI Safety Compliance Dashboard</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+
+<header>
+    🦺 AI Safety Compliance Monitoring System
+</header>
+
+<div class="container">
+
+    <div class="video-box">
+        <h3>Live Camera Feed</h3>
+        <img src="/video">
+    </div>
+
+    <div class="log-box">
+        <h3>Violation Logs</h3>
+        <table>
+            <tr>
+                <th>ID</th>
+                <th>Status</th>
+                <th>Time</th>
+            </tr>
+            {% for log in logs %}
+            <tr class="{{ 'violation' if 'NO' in log.status else 'safe' }}">
+                <td>{{ log.id }}</td>
+                <td>{{ log.status }}</td>
+                <td>{{ log.time }}</td>
+            </tr>
+            {% endfor %}
+        </table>
+    </div>
+
+</div>
+
+<div class="footer">
+    © Hackathon Project | AI-powered Industrial Safety
+</div>
+
+</body>
+</html>
