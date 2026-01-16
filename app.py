@@ -4,14 +4,10 @@ from flask import Flask, render_template, Response
 from ultralytics import YOLO
 from deep_sort_realtime.deepsort_tracker import DeepSort
 
-# -----------------------
-# FLASK APP
-# -----------------------
+
 app = Flask(__name__)
 
-# -----------------------
-# MODELS
-# -----------------------
+
 person_model = YOLO("yolov8n.pt")
 helmet_model = YOLO("models/helmet.pt")
 
@@ -19,9 +15,6 @@ tracker = DeepSort(max_age=30)
 
 cap = cv2.VideoCapture(0)
 
-# -----------------------
-# HELMET CHECK
-# -----------------------
 def has_helmet(person_crop):
     if person_crop.size == 0:
         return False
@@ -36,9 +29,7 @@ def has_helmet(person_crop):
     return False
 
 
-# -----------------------
-# VIDEO GENERATOR
-# -----------------------
+
 def generate_frames():
     while True:
         success, frame = cap.read()
@@ -97,9 +88,7 @@ def generate_frames():
                b"Content-Type: image/jpeg\r\n\r\n" + frame + b"\r\n")
 
 
-# -----------------------
-# ROUTES
-# -----------------------
+
 @app.route("/")
 def index():
     return render_template("index.html")
@@ -111,8 +100,6 @@ def video():
                     mimetype="multipart/x-mixed-replace; boundary=frame")
 
 
-# -----------------------
-# MAIN
-# -----------------------
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8000, debug=False)

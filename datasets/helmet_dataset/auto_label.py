@@ -2,7 +2,7 @@ from ultralytics import YOLO
 import cv2
 import os
 
-model = YOLO("yolov8n.pt")  # pretrained COCO model
+model = YOLO("yolov8n.pt")  
 
 IMAGE_DIR = "images/train"
 LABEL_DIR = "labels/train"
@@ -27,7 +27,6 @@ for img_name in os.listdir(IMAGE_DIR):
                 cls = int(box.cls[0])
                 name = model.names[cls]
 
-                # COCO has "person" and "hat" types; we treat "person" with head region as helmet proxy
                 if name in ["person", "hat"]:
                     x1, y1, x2, y2 = box.xyxy[0]
                     xc = ((x1 + x2) / 2) / w
@@ -35,5 +34,4 @@ for img_name in os.listdir(IMAGE_DIR):
                     bw = (x2 - x1) / w
                     bh = (y2 - y1) / h
 
-                    # class 0 = helmet (proxy)
                     f.write(f"0 {xc:.6f} {yc:.6f} {bw:.6f} {bh:.6f}\n")
