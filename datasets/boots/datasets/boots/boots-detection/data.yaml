@@ -1,0 +1,13 @@
+train: ../train/images
+val: ../valid/images
+test: ../test/images
+
+nc: 4
+names: ['Safety-shoes', 'not_safety_shoe', 'person', 'safety_shoe']
+
+roboflow:
+  workspace: marketwise-vgzpj
+  project: boots-detection-zswnf
+  version: 2
+  license: CC BY 4.0
+  url: https://universe.roboflow.com/marketwise-vgzpj/boots-detection-zswnf/dataset/2
