@@ -1,56 +1,69 @@
 import cv2
-import datetime
-from flask import Flask, render_template, Response
+from flask import Flask, Response, render_template
 from ultralytics import YOLO
 from deep_sort_realtime.deepsort_tracker import DeepSort
+from collections import deque
 
-person_model   = YOLO("yolov8n.pt")
-helmet_model   = YOLO("models/helmet.pt")
-mask_model     = YOLO("models/mask.pt")
-glasses_model  = YOLO("models/glasses.pt")
-boots_model    = YOLO("models/boots.pt")
+# ================= CONFIG =================
+SOURCE_MODE = "video"          # "camera" or "video"
+VIDEO_PATH = "videos/test-video.mp4"
+FRAME_SKIP = 2
+HISTORY_LEN = 15
+THRESHOLD = 0.6
+# =========================================
 
+# ================= MODELS =================
+person_model  = YOLO("yolov8n.pt")
+helmet_model  = YOLO("models/helmet.pt")
+mask_model    = YOLO("models/mask.pt")
+glasses_model = YOLO("models/glasses.pt")
+boots_model   = YOLO("models/boots.pt")
 
+# ================= APP ====================
 app = Flask(__name__)
-
-
-person_model = YOLO("yolov8n.pt")
-helmet_model = YOLO("models/helmet.pt")
-
 tracker = DeepSort(max_age=30)
 
-cap = cv2.VideoCapture(0)
+# ================= VIDEO ==================
+def get_capture():
+    cap = cv2.VideoCapture(VIDEO_PATH if SOURCE_MODE=="video" else 0)
+    if not cap.isOpened():
+        raise RuntimeError("Camera / Video not found")
+    return cap
 
-def has_helmet(person_crop):
-    if person_crop.size == 0:
+cap = get_capture()
+
+# ============ TEMPORAL MEMORY =============
+ppe_history = {}
+frame_count = 0
+
+def stable(history):
+    if len(history) == 0:
         return False
+    return sum(history) / len(history) >= THRESHOLD
 
-    h, _, _ = person_crop.shape
-    head_crop = person_crop[0:int(h * 0.25), :]
-
-    results = helmet_model(head_crop, conf=0.7)
-    for r in results:
-        if r.boxes is not None and len(r.boxes) > 0:
-            return True
-    return False
-
-
-
+# ================= STREAM =================
 def generate_frames():
+    global frame_count
+
     while True:
-        success, frame = cap.read()
-        if not success:
+        ret, frame = cap.read()
+        if not ret:
+            if SOURCE_MODE=="video":
+                cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                continue
             break
 
-        detections = []
-        results = person_model(frame, conf=0.5)
+        frame_count += 1
 
-        for r in results:
-            for box in r.boxes:
-                cls = int(box.cls[0])
-                if person_model.names[cls] == "person":
-                    x1, y1, x2, y2 = map(int, box.xyxy[0])
-                    detections.append(([x1, y1, x2 - x1, y2 - y1], 0.9, "person"))
+        # -------- PERSON DETECTION --------
+        detections = []
+        persons = person_model(frame, conf=0.5)
+
+        for r in persons:
+            for b in r.boxes:
+                if person_model.names[int(b.cls[0])] == "person":
+                    x1,y1,x2,y2 = map(int,b.xyxy[0])
+                    detections.append(([x1,y1,x2-x1,y2-y1],0.9,"person"))
 
         tracks = tracker.update_tracks(detections, frame=frame)
 
@@ -58,54 +71,88 @@ def generate_frames():
             if not t.is_confirmed():
                 continue
 
-            track_id = t.track_id
-            x1, y1, x2, y2 = map(int, t.to_ltrb())
+            tid = t.track_id
+            x1,y1,x2,y2 = map(int,t.to_ltrb())
+            person = frame[y1:y2, x1:x2]
+            if person.size == 0:
+                continue
 
-            person_crop = frame[y1:y2, x1:x2]
-            helmet_present = has_helmet(person_crop)
+            h = person.shape[0]
+            head  = person[0:int(h*0.3), :]
+            face  = person[int(h*0.25):int(h*0.55), :]
+            boots = person[int(h*0.65):h, :]
 
-            if helmet_present:
-                color = (0, 255, 0)
-                status = "HELMET OK"
-            else:
-                color = (0, 0, 255)
-                status = "NO HELMET"
+            if frame_count % FRAME_SKIP == 0:
+                helmet_raw  = any(len(r.boxes)>0 for r in helmet_model(head,  conf=0.4))
+                mask_raw    = any(len(r.boxes)>0 for r in mask_model(face,    conf=0.4))
+                glasses_raw = any(len(r.boxes)>0 for r in glasses_model(face, conf=0.4))
+                boots_raw   = any(len(r.boxes)>0 for r in boots_model(boots,  conf=0.4))
 
-                with open("violations.log", "a") as f:
-                    f.write(
-                        f"ID {track_id} | NO HELMET | {datetime.datetime.now()}\n"
-                    )
+                ppe_history.setdefault(tid,{
+                    "helmet":deque(maxlen=HISTORY_LEN),
+                    "mask":deque(maxlen=HISTORY_LEN),
+                    "glasses":deque(maxlen=HISTORY_LEN),
+                    "boots":deque(maxlen=HISTORY_LEN)
+                })
 
-            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-            cv2.putText(
-                frame,
-                f"ID {track_id} - {status}",
-                (x1, y1 - 10),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.6,
-                color,
-                2
-            )
+                ppe_history[tid]["helmet"].append(helmet_raw)
+                ppe_history[tid]["mask"].append(mask_raw)
+                ppe_history[tid]["glasses"].append(glasses_raw)
+                ppe_history[tid]["boots"].append(boots_raw)
 
-        ret, buffer = cv2.imencode(".jpg", frame)
-        frame = buffer.tobytes()
+            hist = ppe_history[tid]
 
-        yield (b"--frame\r\n"
-               b"Content-Type: image/jpeg\r\n\r\n" + frame + b"\r\n")
+            helmet_ok  = stable(hist["helmet"])
+            mask_ok    = stable(hist["mask"])
+            glasses_ok = stable(hist["glasses"])
+            boots_ok   = stable(hist["boots"])
 
+            # -------- TEXT & COLORS --------
+            def status(txt, ok):
+                return (f"{txt}: OK", (0,255,0)) if ok else (f"{txt}: NO", (0,0,255))
 
+            labels = [
+                status("Helmet", helmet_ok),
+                status("Mask", mask_ok),
+                status("Glasses", glasses_ok),
+                status("Boots", boots_ok)
+            ]
 
+            cv2.rectangle(frame,(x1,y1),(x2,y2),(255,255,255),2)
+
+            y_offset = y1 - 10
+            for text,color in labels:
+                cv2.putText(frame,
+                            text,
+                            (x1, y_offset),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.6,
+                            color,
+                            2)
+                y_offset -= 20
+
+            cv2.putText(frame,
+                        f"ID {tid}",
+                        (x1, y2 + 20),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.6,
+                        (255,255,255),
+                        2)
+
+        _, buffer = cv2.imencode(".jpg", frame)
+        yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" +
+               buffer.tobytes() + b"\r\n")
+
+# ================= ROUTES =================
 @app.route("/")
 def index():
     return render_template("index.html")
 
-
-@app.route("/video")
-def video():
+@app.route("/video_feed")
+def video_feed():
     return Response(generate_frames(),
                     mimetype="multipart/x-mixed-replace; boundary=frame")
 
-
-
+# ================= MAIN ===================
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8000, debug=False)
+    app.run(host="0.0.0.0", port=8000, threaded=True)

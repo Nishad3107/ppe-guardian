@@ -1,24 +1,23 @@
-from ultralytics import YOLO
 import cv2
+from ultralytics import YOLO
 
-model = YOLO("models/helmet.pt")
+helmet = YOLO("models/helmet.pt")
+cap = cv2.VideoCapture("videos/test-video.mp4")
 
-img = cv2.imread("test_helmet.png")
-h, w, _ = frame.shape
-head_crop = frame[0:int(h*0.35), :]   # top 35% only
+while True:
+    ret, frame = cap.read()
+    if not ret:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+        continue
 
-results = model(head_crop, conf=0.6)
+    h = frame.shape[0]
+    head = frame[0:int(h*0.35), :]
 
-for r in results:
-    for box in r.boxes:
-        x1,y1,x2,y2 = map(int, box.xyxy[0])
-        cls = int(box.cls[0])
-        label = model.names[cls]
+    res = helmet(head, conf=0.3)
+    if any(len(r.boxes) > 0 for r in res):
+        cv2.putText(frame,"HELMET DETECTED",(50,50),
+                    cv2.FONT_HERSHEY_SIMPLEX,1,(0,255,0),3)
 
-        cv2.rectangle(img, (x1,y1), (x2,y2), (0,255,0), 2)
-        cv2.putText(img, label, (x1,y1-10),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,0), 2)
-
-cv2.imshow("Helmet Test", img)
-cv2.waitKey(0)
-cv2.destroyAllWindows()
+    cv2.imshow("Helmet Test", frame)
+    if cv2.waitKey(1) & 0xFF == ord("q"):
+        break
