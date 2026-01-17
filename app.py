@@ -6,9 +6,9 @@ from deep_sort_realtime.deepsort_tracker import DeepSort
 
 person_model   = YOLO("yolov8n.pt")
 helmet_model   = YOLO("models/helmet.pt")
-#mask_model     = YOLO("models/mask.pt")
-#glasses_model  = YOLO("models/glasses.pt")
-#boots_model    = YOLO("models/boots.pt")
+mask_model     = YOLO("models/mask.pt")
+glasses_model  = YOLO("models/glasses.pt")
+boots_model    = YOLO("models/boots.pt")
 
 
 app = Flask(__name__)
