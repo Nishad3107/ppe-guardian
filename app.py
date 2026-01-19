@@ -1,69 +1,68 @@
 import cv2
-from flask import Flask, Response, render_template
+import datetime
+import os
+from flask import Flask, render_template, Response
 from ultralytics import YOLO
 from deep_sort_realtime.deepsort_tracker import DeepSort
-from collections import deque
 
-# ================= CONFIG =================
-SOURCE_MODE = "video"          # "camera" or "video"
-VIDEO_PATH = "videos/test-video.mp4"
-FRAME_SKIP = 2
-HISTORY_LEN = 15
-THRESHOLD = 0.6
-# =========================================
-
-# ================= MODELS =================
-person_model  = YOLO("yolov8n.pt")
-helmet_model  = YOLO("models/helmet.pt")
-mask_model    = YOLO("models/mask.pt")
-glasses_model = YOLO("models/glasses.pt")
-boots_model   = YOLO("models/boots.pt")
-
-# ================= APP ====================
 app = Flask(__name__)
+
+person_model = YOLO("yolov8n.pt")
+ppe_model = YOLO("models/ppe.pt")
+
 tracker = DeepSort(max_age=30)
 
-# ================= VIDEO ==================
-def get_capture():
-    cap = cv2.VideoCapture(VIDEO_PATH if SOURCE_MODE=="video" else 0)
-    if not cap.isOpened():
-        raise RuntimeError("Camera / Video not found")
-    return cap
+cap = None
+SOURCE = "CAMERA"
 
-cap = get_capture()
+def open_camera():
+    global cap, SOURCE
+    if cap:
+        cap.release()
+    cap = cv2.VideoCapture(0)
+    SOURCE = "CAMERA"
 
-# ============ TEMPORAL MEMORY =============
-ppe_history = {}
-frame_count = 0
+def open_recorded_video():
+    global cap, SOURCE
+    if cap:
+        cap.release()
+    cap = cv2.VideoCapture("videos/recorded.mp4")
+    SOURCE = "RECORDED_VIDEO"
 
-def stable(history):
-    if len(history) == 0:
-        return False
-    return sum(history) / len(history) >= THRESHOLD
+def check_ppe(person_crop):
+    status = {"helmet": False, "mask": False, "glasses": False, "boots": False}
+    if person_crop is None or person_crop.size == 0:
+        return status
 
-# ================= STREAM =================
+    results = ppe_model(person_crop, conf=0.35)[0]
+    if results.boxes is None:
+        return status
+
+    for box in results.boxes:
+        cls = ppe_model.names[int(box.cls[0])]
+        if cls in status:
+            status[cls] = True
+    return status
+
 def generate_frames():
-    global frame_count
+    global cap
 
     while True:
-        ret, frame = cap.read()
-        if not ret:
-            if SOURCE_MODE=="video":
-                cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                continue
+        if cap is None:
+            continue
+
+        success, frame = cap.read()
+        if not success:
             break
 
-        frame_count += 1
-
-        # -------- PERSON DETECTION --------
         detections = []
-        persons = person_model(frame, conf=0.5)
+        persons = person_model(frame, conf=0.5)[0]
 
-        for r in persons:
-            for b in r.boxes:
-                if person_model.names[int(b.cls[0])] == "person":
-                    x1,y1,x2,y2 = map(int,b.xyxy[0])
-                    detections.append(([x1,y1,x2-x1,y2-y1],0.9,"person"))
+        if persons.boxes:
+            for box in persons.boxes:
+                if person_model.names[int(box.cls[0])] == "person":
+                    x1, y1, x2, y2 = map(int, box.xyxy[0])
+                    detections.append(([x1, y1, x2 - x1, y2 - y1], 0.9, "person"))
 
         tracks = tracker.update_tracks(detections, frame=frame)
 
@@ -72,87 +71,65 @@ def generate_frames():
                 continue
 
             tid = t.track_id
-            x1,y1,x2,y2 = map(int,t.to_ltrb())
-            person = frame[y1:y2, x1:x2]
-            if person.size == 0:
-                continue
+            x1, y1, x2, y2 = map(int, t.to_ltrb())
+            crop = frame[y1:y2, x1:x2]
+            ppe = check_ppe(crop)
 
-            h = person.shape[0]
-            head  = person[0:int(h*0.3), :]
-            face  = person[int(h*0.25):int(h*0.55), :]
-            boots = person[int(h*0.65):h, :]
+            cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 200, 0), 2)
+            cv2.putText(frame, f"ID {tid}", (x1, y1 - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 200, 0), 2)
 
-            if frame_count % FRAME_SKIP == 0:
-                helmet_raw  = any(len(r.boxes)>0 for r in helmet_model(head,  conf=0.4))
-                mask_raw    = any(len(r.boxes)>0 for r in mask_model(face,    conf=0.4))
-                glasses_raw = any(len(r.boxes)>0 for r in glasses_model(face, conf=0.4))
-                boots_raw   = any(len(r.boxes)>0 for r in boots_model(boots,  conf=0.4))
+            y = y1 + 20
+            violation = False
 
-                ppe_history.setdefault(tid,{
-                    "helmet":deque(maxlen=HISTORY_LEN),
-                    "mask":deque(maxlen=HISTORY_LEN),
-                    "glasses":deque(maxlen=HISTORY_LEN),
-                    "boots":deque(maxlen=HISTORY_LEN)
-                })
+            for k, v in ppe.items():
+                txt = f"{k.upper()}: {'OK' if v else 'NO'}"
+                col = (0, 255, 0) if v else (0, 0, 255)
+                cv2.putText(frame, txt, (x1, y),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, col, 2)
+                y += 18
+                if not v:
+                    violation = True
 
-                ppe_history[tid]["helmet"].append(helmet_raw)
-                ppe_history[tid]["mask"].append(mask_raw)
-                ppe_history[tid]["glasses"].append(glasses_raw)
-                ppe_history[tid]["boots"].append(boots_raw)
+            if violation:
+                with open("violations.log", "a") as f:
+                    f.write(
+                        f"{datetime.datetime.now()} | SOURCE={SOURCE} | ID={tid} | {ppe}\n"
+                    )
 
-            hist = ppe_history[tid]
+        ret, buffer = cv2.imencode(".jpg", frame)
+        frame = buffer.tobytes()
 
-            helmet_ok  = stable(hist["helmet"])
-            mask_ok    = stable(hist["mask"])
-            glasses_ok = stable(hist["glasses"])
-            boots_ok   = stable(hist["boots"])
+        yield (b"--frame\r\n"
+               b"Content-Type: image/jpeg\r\n\r\n" + frame + b"\r\n")
 
-            # -------- TEXT & COLORS --------
-            def status(txt, ok):
-                return (f"{txt}: OK", (0,255,0)) if ok else (f"{txt}: NO", (0,0,255))
-
-            labels = [
-                status("Helmet", helmet_ok),
-                status("Mask", mask_ok),
-                status("Glasses", glasses_ok),
-                status("Boots", boots_ok)
-            ]
-
-            cv2.rectangle(frame,(x1,y1),(x2,y2),(255,255,255),2)
-
-            y_offset = y1 - 10
-            for text,color in labels:
-                cv2.putText(frame,
-                            text,
-                            (x1, y_offset),
-                            cv2.FONT_HERSHEY_SIMPLEX,
-                            0.6,
-                            color,
-                            2)
-                y_offset -= 20
-
-            cv2.putText(frame,
-                        f"ID {tid}",
-                        (x1, y2 + 20),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.6,
-                        (255,255,255),
-                        2)
-
-        _, buffer = cv2.imencode(".jpg", frame)
-        yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" +
-               buffer.tobytes() + b"\r\n")
-
-# ================= ROUTES =================
 @app.route("/")
 def index():
     return render_template("index.html")
+
+@app.route("/camera")
+def camera():
+    open_camera()
+    return render_template("camera.html")
+
+@app.route("/recorded")
+def recorded():
+    open_recorded_video()
+    return render_template("camera.html")
 
 @app.route("/video_feed")
 def video_feed():
     return Response(generate_frames(),
                     mimetype="multipart/x-mixed-replace; boundary=frame")
 
-# ================= MAIN ===================
+@app.route("/dashboard")
+def dashboard():
+    if not os.path.exists("violations.log"):
+        return render_template("dashboard.html", logs=[])
+    with open("violations.log", "r") as f:
+        logs = f.readlines()
+    return render_template("dashboard.html", logs=logs)
+
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8000, threaded=True)
+    open_camera()
+    app.run(host="0.0.0.0", port=8000, debug=False)
