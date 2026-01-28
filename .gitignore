@@ -1,4 +1,6 @@
 venv/
+source/
+env/
 __pycache__/
 *.pyc
 runs/
