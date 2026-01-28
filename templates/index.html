@@ -22,8 +22,14 @@
 
     <div class="hero-buttons">
         <a href="/camera" class="btn primary">🎥 Live Camera</a>
-        <a href="/recorded" class="btn secondary">📼 Recorded Video</a>
     </div>
+
+    <h2>Recorded Videos</h2>
+    <ul>
+        {% for video in videos %}
+            <li><a href="/recorded/{{ video }}">{{ video }}</a></li>
+        {% endfor %}
+    </ul>
 </section>
 
 <footer class="footer">
