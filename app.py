@@ -15,19 +15,16 @@ tracker = DeepSort(max_age=30)
 cap = None
 SOURCE = "CAMERA"
 
-def open_camera():
+def open_video_stream(source="CAMERA"):
     global cap, SOURCE
     if cap:
         cap.release()
-    cap = cv2.VideoCapture(0)
-    SOURCE = "CAMERA"
-
-def open_recorded_video():
-    global cap, SOURCE
-    if cap:
-        cap.release()
-    cap = cv2.VideoCapture("videos/recorded.mp4")
-    SOURCE = "RECORDED_VIDEO"
+    if source == "CAMERA":
+        cap = cv2.VideoCapture(0)
+        SOURCE = "CAMERA"
+    else:
+        cap = cv2.VideoCapture(source)
+        SOURCE = source
 
 def check_ppe(person_crop):
     status = {"helmet": False, "mask": False, "glasses": False, "boots": False}
@@ -105,16 +102,17 @@ def generate_frames():
 
 @app.route("/")
 def index():
-    return render_template("index.html")
+    videos = [v for v in os.listdir("videos") if v.endswith(".mp4")]
+    return render_template("index.html", videos=videos)
 
 @app.route("/camera")
 def camera():
-    open_camera()
+    open_video_stream("CAMERA")
     return render_template("camera.html")
 
-@app.route("/recorded")
-def recorded():
-    open_recorded_video()
+@app.route("/recorded/<filename>")
+def recorded(filename):
+    open_video_stream(f"videos/{filename}")
     return render_template("camera.html")
 
 @app.route("/video_feed")
@@ -131,5 +129,5 @@ def dashboard():
     return render_template("dashboard.html", logs=logs)
 
 if __name__ == "__main__":
-    open_camera()
+    open_video_stream()
     app.run(host="0.0.0.0", port=8000, debug=False)
