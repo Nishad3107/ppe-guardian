@@ -1,8 +1,27 @@
-venv/
+# Python
 __pycache__/
 *.pyc
-runs/
-violations.log
+*.pyo
+*.pyd
+
+# Virtual environment
+venv/
 .env
+
+# Mac files
 .DS_Store
-models/helmet.pt
+
+# Logs
+*.log
+violations.log
+
+# ML / Training outputs
+runs/
+datasets/
+
+# Model weights
+*.pt
+*.pth
+
+# Temporary
+*.tmp
