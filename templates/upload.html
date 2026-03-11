@@ -1,15 +1,32 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Upload Video</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
 </head>
 <body>
-  <h2>Upload Recorded Video</h2>
+  <header class="navbar">
+    <div class="brand">PPE Guardian</div>
+    <nav class="nav-links">
+      <a href="/">Home</a>
+      <a href="/camera">Live Camera</a>
+      <a href="/recorded">Recorded Video</a>
+      <a href="/upload">Upload Video</a>
+      <a href="/dashboard">Dashboard</a>
+    </nav>
+  </header>
 
-  <form method="POST" enctype="multipart/form-data">
-    <input type="file" name="video" accept="video/mp4" required>
-    <br><br>
-    <button type="submit">Start Detection</button>
-  </form>
+  <main class="page page-upload">
+    <section class="panel upload-panel">
+      <h2>Upload a Video for PPE Monitoring</h2>
+      <p class="muted">Supported formats: mp4, mov, avi, mkv, m4v</p>
+      <form method="POST" enctype="multipart/form-data" class="upload-form">
+        <input type="file" name="video" accept="video/*" required>
+        <button class="btn btn-primary" type="submit">Start Detection</button>
+      </form>
+    </section>
+  </main>
 </body>
 </html>

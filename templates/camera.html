@@ -1,10 +1,66 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
-  <title>Live Detection</title>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>PPE Live Feed</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
 </head>
 <body>
-  <h2>PPE Detection</h2>
-  <img src="/video_feed" width="900">
+  <header class="navbar">
+    <div class="brand">PPE Guardian</div>
+    <nav class="nav-links">
+      <a href="/">Home</a>
+      <a href="/camera">Live Camera</a>
+      <a href="/recorded">Recorded Video</a>
+      <a href="/upload">Upload Video</a>
+      <a href="/dashboard">Dashboard</a>
+    </nav>
+  </header>
+
+  <main class="page">
+    <section class="grid-two">
+      <article class="panel">
+        <div class="panel-head">
+          <h2>{{ source }}</h2>
+          <span class="badge">{{ source_path }}</span>
+        </div>
+        <img class="stream" src="/video_feed" alt="Live PPE Detection Stream">
+      </article>
+
+      <article class="panel">
+        <h2>Live Status</h2>
+        <div class="stats-grid">
+          <div class="stat"><span>People Detected</span><strong id="people">0</strong></div>
+          <div class="stat"><span>Active Tracks</span><strong id="tracks">0</strong></div>
+          <div class="stat"><span>Violating Tracks</span><strong id="violations">0</strong></div>
+          <div class="stat"><span>Total Logged</span><strong id="total">0</strong></div>
+        </div>
+        <p class="muted" id="frameTime">Waiting for first frame...</p>
+      </article>
+    </section>
+  </main>
+
+  <script>
+    async function refreshMetrics() {
+      try {
+        const res = await fetch('/api/metrics');
+        const data = await res.json();
+
+        document.getElementById('people').textContent = data.people_detected ?? 0;
+        document.getElementById('tracks').textContent = data.active_tracks ?? 0;
+        document.getElementById('violations').textContent = data.violating_tracks ?? 0;
+        document.getElementById('total').textContent = data.total_logged_violations ?? 0;
+        document.getElementById('frameTime').textContent = data.frame_time
+          ? `Last frame: ${new Date(data.frame_time).toLocaleString()}`
+          : 'Waiting for first frame...';
+      } catch (_) {
+        document.getElementById('frameTime').textContent = 'Unable to fetch live metrics.';
+      }
+    }
+
+    refreshMetrics();
+    setInterval(refreshMetrics, 2000);
+  </script>
 </body>
 </html>

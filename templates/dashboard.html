@@ -1,45 +1,188 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
-    <title>AI Safety Compliance Dashboard</title>
-    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>PPE Dashboard</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
 </head>
 <body>
+  <header class="navbar">
+    <div class="brand">PPE Guardian</div>
+    <nav class="nav-links">
+      <a href="/">Home</a>
+      <a href="/camera">Live Camera</a>
+      <a href="/recorded">Recorded Video</a>
+      <a href="/upload">Upload Video</a>
+      <a href="/dashboard">Dashboard</a>
+    </nav>
+  </header>
 
-<header>
-    🦺 AI Safety Compliance Monitoring System
-</header>
+  <main class="page">
+    <section class="stats-grid">
+      <div class="stat"><span>Source</span><strong id="source">-</strong></div>
+      <div class="stat"><span>People Detected</span><strong id="people">0</strong></div>
+      <div class="stat"><span>Active Tracks</span><strong id="tracks">0</strong></div>
+      <div class="stat"><span>Violating Tracks</span><strong id="violating">0</strong></div>
+      <div class="stat"><span>Total Violations Logged</span><strong id="total">0</strong></div>
+    </section>
 
-<div class="container">
+    <section class="grid-two">
+      <article class="panel">
+        <div class="panel-head">
+          <h2>Live Feed</h2>
+          <a class="btn btn-secondary" href="/camera">Open in Camera View</a>
+        </div>
+        <img class="stream" src="/video_feed" alt="Live PPE feed">
+        <p class="muted" id="frameTime">Last frame: -</p>
+      </article>
 
-    <div class="video-box">
-        <h3>Live Camera Feed</h3>
-        <img src="/video">
-    </div>
-
-    <div class="log-box">
-        <h3>Violation Logs</h3>
-        <table>
-            <tr>
-                <th>ID</th>
-                <th>Status</th>
+      <article class="panel">
+        <div class="panel-head">
+          <h2>Recent Violations</h2>
+          <button class="btn btn-secondary" id="refreshLogsBtn" type="button">Refresh</button>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
                 <th>Time</th>
-            </tr>
-            {% for log in logs %}
-            <tr class="{{ 'violation' if 'NO' in log.status else 'safe' }}">
-                <td>{{ log.id }}</td>
-                <td>{{ log.status }}</td>
-                <td>{{ log.time }}</td>
-            </tr>
-            {% endfor %}
-        </table>
-    </div>
+                <th>Source</th>
+                <th>ID</th>
+                <th>Missing PPE</th>
+              </tr>
+            </thead>
+            <tbody id="logRows">
+              <tr><td colspan="4" class="muted">Loading...</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </article>
+    </section>
 
-</div>
+    <section class="panel">
+      <div class="panel-head">
+        <h2>Datasets</h2>
+        <button class="btn btn-secondary" id="refreshDatasetsBtn" type="button">Refresh Datasets</button>
+      </div>
+      <div class="cards-grid" id="datasetCards">
+        <article class="card"><p class="muted">Loading dataset summary...</p></article>
+      </div>
+    </section>
+  </main>
 
-<div class="footer">
-    © Hackathon Project | AI-powered Industrial Safety
-</div>
+  <script>
+    function formatTime(value) {
+      if (!value) return '-';
+      const d = new Date(value);
+      if (Number.isNaN(d.getTime())) return value;
+      return d.toLocaleString();
+    }
 
+    function safeHtml(value) {
+      return String(value)
+        .replaceAll('&', '&amp;')
+        .replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;')
+        .replaceAll('"', '&quot;')
+        .replaceAll("'", '&#39;');
+    }
+
+    async function refreshMetrics() {
+      try {
+        const res = await fetch('/api/metrics');
+        const data = await res.json();
+
+        document.getElementById('source').textContent = `${data.source ?? '-'} (${data.source_path ?? '-'})`;
+        document.getElementById('people').textContent = data.people_detected ?? 0;
+        document.getElementById('tracks').textContent = data.active_tracks ?? 0;
+        document.getElementById('violating').textContent = data.violating_tracks ?? 0;
+        document.getElementById('total').textContent = data.total_logged_violations ?? 0;
+        document.getElementById('frameTime').textContent = `Last frame: ${formatTime(data.frame_time)}`;
+      } catch (_) {
+        document.getElementById('frameTime').textContent = 'Last frame: unavailable';
+      }
+    }
+
+    async function refreshLogs() {
+      const tbody = document.getElementById('logRows');
+      try {
+        const res = await fetch('/api/logs?limit=50');
+        const data = await res.json();
+        const logs = data.logs ?? [];
+
+        if (!logs.length) {
+          tbody.innerHTML = '<tr><td colspan="4" class="muted">No violations logged yet.</td></tr>';
+          return;
+        }
+
+        tbody.innerHTML = logs.map((log) => {
+          const missing = Array.isArray(log.missing) && log.missing.length
+            ? log.missing.join(', ')
+            : '-';
+
+          return `<tr>
+            <td>${safeHtml(formatTime(log.timestamp))}</td>
+            <td>${safeHtml(log.source ?? '-')}</td>
+            <td>${safeHtml(log.id ?? '-')}</td>
+            <td>${safeHtml(missing)}</td>
+          </tr>`;
+        }).join('');
+      } catch (_) {
+        tbody.innerHTML = '<tr><td colspan="4" class="muted">Unable to load logs.</td></tr>';
+      }
+    }
+
+    function renderDatasetCard(ds) {
+      const splitNames = ['train', 'valid', 'test'];
+      const splitRows = splitNames
+        .filter((name) => ds.splits && ds.splits[name])
+        .map((name) => {
+          const split = ds.splits[name];
+          return `<li>${name}: ${split.images ?? 0} images / ${split.labels ?? 0} labels</li>`;
+        })
+        .join('');
+
+      const classes = Array.isArray(ds.classes) && ds.classes.length
+        ? ds.classes.join(', ')
+        : 'Not declared';
+
+      return `<article class="card">
+        <h3>${safeHtml(ds.name ?? 'dataset')}</h3>
+        <p><strong>Classes:</strong> ${safeHtml(classes)}</p>
+        <ul class="compact-list">${splitRows || '<li>No split data found</li>'}</ul>
+      </article>`;
+    }
+
+    async function refreshDatasets(force = false) {
+      const cards = document.getElementById('datasetCards');
+      try {
+        const url = force ? '/api/datasets?refresh=1' : '/api/datasets';
+        const res = await fetch(url);
+        const data = await res.json();
+        const datasets = data.datasets ?? [];
+
+        if (!datasets.length) {
+          cards.innerHTML = '<article class="card"><p class="muted">No dataset structure detected in /datasets.</p></article>';
+          return;
+        }
+
+        cards.innerHTML = datasets.map(renderDatasetCard).join('');
+      } catch (_) {
+        cards.innerHTML = '<article class="card"><p class="muted">Unable to load dataset summary.</p></article>';
+      }
+    }
+
+    document.getElementById('refreshLogsBtn').addEventListener('click', refreshLogs);
+    document.getElementById('refreshDatasetsBtn').addEventListener('click', () => refreshDatasets(true));
+
+    refreshMetrics();
+    refreshLogs();
+    refreshDatasets();
+
+    setInterval(refreshMetrics, 2000);
+    setInterval(refreshLogs, 3000);
+    setInterval(refreshDatasets, 30000);
+  </script>
 </body>
 </html>

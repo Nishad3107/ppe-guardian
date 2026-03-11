@@ -1,34 +1,50 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <title>PPE Guardian</title>
-    <link rel="stylesheet" href="/static/style.css">
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>PPE Guardian</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
 </head>
 <body>
+  <header class="navbar">
+    <div class="brand">PPE Guardian</div>
+    <nav class="nav-links">
+      <a href="/camera">Live Camera</a>
+      <a href="/recorded">Recorded Video</a>
+      <a href="/upload">Upload Video</a>
+      <a href="/dashboard">Dashboard</a>
+    </nav>
+  </header>
 
-<header class="navbar">
-    <div class="logo">🦺 PPE Guardian</div>
-    <div class="nav-links">
-        <a href="/camera">Live Camera</a>
-        <a href="/recorded">Recorded Video</a>
-        <a href="/dashboard">Dashboard</a>
-    </div>
-</header>
+  <main class="page page-home">
+    <section class="hero-card">
+      <p class="eyebrow">Industrial Safety Monitoring</p>
+      <h1>Real-time PPE compliance from camera and video sources</h1>
+      <p>
+        Person detection, tracking, and PPE checks are connected in one pipeline.
+        Use live camera, test video, or upload your own video for analysis.
+      </p>
+      <div class="hero-actions">
+        <a class="btn btn-primary" href="/camera">Start Live Camera</a>
+        <a class="btn btn-secondary" href="/dashboard">Open Dashboard</a>
+      </div>
+    </section>
 
-<section class="hero">
-    <h1>Smart PPE Compliance Monitoring</h1>
-    <p>Real-time PPE detection on Live CCTV and Recorded Videos</p>
-
-    <div class="hero-buttons">
-        <a href="/camera" class="btn primary">🎥 Live Camera</a>
-        <a href="/recorded" class="btn secondary">📼 Recorded Video</a>
-    </div>
-</section>
-
-<footer class="footer">
-    <p>© 2026 PPE Guardian</p>
-</footer>
-
+    <section class="cards-grid">
+      <article class="card">
+        <h3>Connected Detection Stack</h3>
+        <p>YOLO person detection + DeepSORT tracking + PPE model checks for each tracked worker.</p>
+      </article>
+      <article class="card">
+        <h3>Real-World Logging</h3>
+        <p>Violation logs are cooldown-controlled to avoid repeated frame-by-frame duplicates.</p>
+      </article>
+      <article class="card">
+        <h3>Live Metrics</h3>
+        <p>Dashboard metrics and logs auto-refresh without page reload for operations monitoring.</p>
+      </article>
+    </section>
+  </main>
 </body>
 </html>

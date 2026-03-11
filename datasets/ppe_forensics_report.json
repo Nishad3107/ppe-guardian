@@ -1,0 +1,226 @@
+{
+  "datasets": {
+    "helmet_dataset": {
+      "root": "datasets/helmet_dataset",
+      "exists": true,
+      "expected_semantics": [
+        "helmet",
+        "no_helmet"
+      ],
+      "data_yaml": "datasets/helmet_dataset/data.yaml",
+      "class_id_to_name": {
+        "0": "helmet",
+        "1": "mask",
+        "2": "glasses",
+        "3": "boots"
+      },
+      "unique_class_ids_found": [
+        0
+      ],
+      "class_id_counts": {
+        "0": 16381
+      },
+      "negative_classes_in_names": [],
+      "split_summary": {
+        "train": {
+          "images_dir": "datasets/helmet_dataset/images/train",
+          "labels_dir": "datasets/helmet_dataset/labels/train",
+          "image_files": 5000,
+          "label_files": 5000
+        }
+      },
+      "missing_val_split": true,
+      "label_parse_errors": [],
+      "label_parse_error_count": 0,
+      "ids_without_name_mapping": [],
+      "mapped_ids_with_zero_labels": [
+        1,
+        2,
+        3
+      ]
+    },
+    "mask_dataset": {
+      "root": "datasets/mask/mask-detection",
+      "exists": true,
+      "expected_semantics": [
+        "mask",
+        "no_mask"
+      ],
+      "data_yaml": "datasets/mask/mask-detection/data.yaml",
+      "class_id_to_name": {
+        "0": "mask"
+      },
+      "unique_class_ids_found": [
+        0,
+        1
+      ],
+      "class_id_counts": {
+        "0": 212,
+        "1": 149
+      },
+      "negative_classes_in_names": [],
+      "split_summary": {
+        "train": {
+          "images_dir": "datasets/mask/mask-detection/train/images",
+          "labels_dir": "datasets/mask/mask-detection/train/labels",
+          "image_files": 272,
+          "label_files": 272
+        },
+        "valid": {
+          "images_dir": "datasets/mask/mask-detection/valid/images",
+          "labels_dir": "datasets/mask/mask-detection/valid/labels",
+          "image_files": 20,
+          "label_files": 20
+        },
+        "test": {
+          "images_dir": "datasets/mask/mask-detection/test/images",
+          "labels_dir": "datasets/mask/mask-detection/test/labels",
+          "image_files": 8,
+          "label_files": 8
+        }
+      },
+      "missing_val_split": false,
+      "label_parse_errors": [],
+      "label_parse_error_count": 0,
+      "ids_without_name_mapping": [
+        1
+      ],
+      "mapped_ids_with_zero_labels": []
+    },
+    "glasses_dataset": {
+      "root": "datasets/glasses",
+      "exists": true,
+      "expected_semantics": [
+        "glasses",
+        "no_glasses"
+      ],
+      "data_yaml": "datasets/glasses/data.yaml",
+      "class_id_to_name": {
+        "0": "glasses"
+      },
+      "unique_class_ids_found": [
+        0,
+        1,
+        2,
+        3
+      ],
+      "class_id_counts": {
+        "0": 110,
+        "1": 1,
+        "2": 17,
+        "3": 144
+      },
+      "negative_classes_in_names": [],
+      "split_summary": {
+        "train": {
+          "images_dir": "datasets/glasses/train/images",
+          "labels_dir": "datasets/glasses/train/labels",
+          "image_files": 141,
+          "label_files": 141
+        },
+        "valid": {
+          "images_dir": "datasets/glasses/valid/images",
+          "labels_dir": "datasets/glasses/valid/labels",
+          "image_files": 41,
+          "label_files": 41
+        },
+        "test": {
+          "images_dir": "datasets/glasses/test/images",
+          "labels_dir": "datasets/glasses/test/labels",
+          "image_files": 21,
+          "label_files": 21
+        }
+      },
+      "missing_val_split": false,
+      "label_parse_errors": [],
+      "label_parse_error_count": 0,
+      "ids_without_name_mapping": [
+        1,
+        2,
+        3
+      ],
+      "mapped_ids_with_zero_labels": []
+    },
+    "boots_dataset": {
+      "root": "datasets/boots/datasets/boots/boots-detection",
+      "exists": true,
+      "expected_semantics": [
+        "boots",
+        "no_boots"
+      ],
+      "data_yaml": "datasets/boots/datasets/boots/boots-detection/data.yaml",
+      "class_id_to_name": {
+        "0": "Safety-shoes",
+        "1": "not_safety_shoe",
+        "2": "person",
+        "3": "safety_shoe"
+      },
+      "unique_class_ids_found": [
+        0,
+        1,
+        2,
+        3
+      ],
+      "class_id_counts": {
+        "0": 84,
+        "1": 35,
+        "2": 297,
+        "3": 3763
+      },
+      "negative_classes_in_names": [
+        "not_safety_shoe"
+      ],
+      "split_summary": {
+        "train": {
+          "images_dir": "datasets/boots/datasets/boots/boots-detection/train/images",
+          "labels_dir": "datasets/boots/datasets/boots/boots-detection/train/labels",
+          "image_files": 1375,
+          "label_files": 1375
+        },
+        "valid": {
+          "images_dir": "datasets/boots/datasets/boots/boots-detection/valid/images",
+          "labels_dir": "datasets/boots/datasets/boots/boots-detection/valid/labels",
+          "image_files": 176,
+          "label_files": 176
+        },
+        "test": {
+          "images_dir": "datasets/boots/datasets/boots/boots-detection/test/images",
+          "labels_dir": "datasets/boots/datasets/boots/boots-detection/test/labels",
+          "image_files": 142,
+          "label_files": 142
+        }
+      },
+      "missing_val_split": false,
+      "label_parse_errors": [],
+      "label_parse_error_count": 0,
+      "ids_without_name_mapping": [],
+      "mapped_ids_with_zero_labels": []
+    }
+  },
+  "collisions": {
+    "class_id_name_collisions": {
+      "0": [
+        "glasses",
+        "helmet",
+        "mask",
+        "safety_shoes"
+      ],
+      "1": [
+        "mask",
+        "not_safety_shoe"
+      ],
+      "2": [
+        "glasses",
+        "person"
+      ],
+      "3": [
+        "boots",
+        "safety_shoe"
+      ]
+    }
+  },
+  "merge_risks": {
+    "label_filename_overwrite_risk_count": 0,
+    "label_filename_overwrite_examples": {}
+  }
+}
