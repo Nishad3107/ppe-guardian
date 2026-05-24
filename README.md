@@ -28,4 +28,18 @@ from the head region. Violations are highlighted and logged with timestamps.
 
 ## Run Locally
 ```bash
+npm run dev
+```
+
+Fallback:
+```bash
 python app.py
+```
+
+## Local Config
+```bash
+cp .env.example .env.local
+```
+
+Use `.env.local` for machine-specific settings such as `SERVER_PORT`,
+`AUTO_OPEN_SOURCE`, or `REQUIRE_VALID_PPE_MODEL`. The file is ignored by git.

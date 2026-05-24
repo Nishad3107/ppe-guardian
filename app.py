@@ -16,10 +16,31 @@ from typing import Any, Optional
 import cv2
 import numpy as np
 from deep_sort_realtime.deepsort_tracker import DeepSort
-from flask import Flask, Response, jsonify, redirect, render_template, request, url_for
+from flask import Flask, Response, jsonify, redirect, render_template, request, send_from_directory, url_for
 from ultralytics import YOLO
 
 app = Flask(__name__)
+
+
+def _load_local_env_file(path: Path) -> None:
+    if not path.exists():
+        return
+
+    try:
+        lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
+    except OSError as exc:
+        logging.getLogger("ppe_guardian").warning("Failed to read local env file %s: %s", path, exc)
+        return
+
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        if not key:
+            continue
+        os.environ.setdefault(key, value.strip().strip("\"'"))
 
 PPE_ITEMS = ("helmet", "mask", "glasses", "boots")
 EXPECTED_PPE_CLASSES = (
@@ -36,6 +57,8 @@ if not LOGGER.handlers:
         level=os.getenv("LOG_LEVEL", "INFO").upper(),
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
+
+_load_local_env_file(Path(".env.local"))
 
 
 def _env_float(name: str, default: float) -> float:
@@ -73,6 +96,9 @@ VIOLATIONS_LOG_PATH = Path(os.getenv("VIOLATIONS_LOG_PATH", "violations.log"))
 APP_ENV = os.getenv("APP_ENV", os.getenv("FLASK_ENV", "development")).strip().lower()
 IS_PRODUCTION = APP_ENV == "production"
 REQUIRE_VALID_PPE_MODEL = _env_bool("REQUIRE_VALID_PPE_MODEL", False)
+AUTO_OPEN_SOURCE = os.getenv("AUTO_OPEN_SOURCE", "recorded").strip().lower()
+SERVER_HOST = os.getenv("SERVER_HOST", "127.0.0.1").strip()
+SERVER_PORT = _env_int("SERVER_PORT", 8000)
 
 PERSON_CONFIDENCE_THRESHOLD = _env_float("PERSON_CONFIDENCE_THRESHOLD", 0.45)
 PPE_CONFIDENCE_THRESHOLD = _env_float("PPE_CONFIDENCE_THRESHOLD", 0.35)
@@ -212,6 +238,7 @@ MODEL_INTEGRITY_STATUS: dict[str, Any] = {
     "error": None,
 }
 PPE_CLASS_MAP, PPE_CLASS_ITEM_MAP = _build_ppe_class_maps(PPE_MODEL)
+PPE_DETECTION_ENABLED = PPE_MODEL is not None
 LAST_PERF_WARNING_BY_STAGE: dict[str, float] = {}
 
 # Use external embeddings so DeepSORT does not require optional embedder deps at init time.
@@ -244,7 +271,10 @@ LIVE_METRICS = {
     "ppe_model_source": PPE_MODEL_SOURCE,
     "model_integrity_ok": False,
     "model_missing_classes": [],
+    "ppe_detection_enabled": PPE_DETECTION_ENABLED,
     "fps_overlay_enabled": FPS_OVERLAY_ENABLED,
+    "source_ready": False,
+    "source_error": None,
 }
 METRICS_LOCK = threading.Lock()
 
@@ -276,7 +306,7 @@ def _snapshot_metrics() -> dict[str, Any]:
 
 
 def run_startup_validation(fail_on_error: bool = False) -> dict[str, Any]:
-    global MODEL_INTEGRITY_STATUS, PPE_CLASS_MAP, PPE_CLASS_ITEM_MAP
+    global MODEL_INTEGRITY_STATUS, PPE_CLASS_MAP, PPE_CLASS_ITEM_MAP, PPE_DETECTION_ENABLED
 
     if PPE_MODEL is None:
         MODEL_INTEGRITY_STATUS = {
@@ -301,12 +331,14 @@ def run_startup_validation(fail_on_error: bool = False) -> dict[str, Any]:
             _log_structured(logging.ERROR, "model_integrity_failure", MODEL_INTEGRITY_STATUS)
 
     PPE_CLASS_MAP, PPE_CLASS_ITEM_MAP = _build_ppe_class_maps(PPE_MODEL)
+    PPE_DETECTION_ENABLED = MODEL_INTEGRITY_STATUS["ok"] and PPE_MODEL is not None
     _set_metrics(
         model_integrity_ok=MODEL_INTEGRITY_STATUS["ok"],
-        ppe_supported_items=_supported_ppe_items(PPE_CLASS_MAP),
+        ppe_supported_items=_supported_ppe_items(PPE_CLASS_MAP) if PPE_DETECTION_ENABLED else [],
         model_missing_classes=MODEL_INTEGRITY_STATUS.get("missing_classes", []),
         ppe_model_path=MODEL_INTEGRITY_STATUS.get("model_path", PPE_MODEL_USED_PATH or str(PPE_MODEL_PATH)),
         ppe_model_source=MODEL_INTEGRITY_STATUS.get("model_source", PPE_MODEL_SOURCE),
+        ppe_detection_enabled=PPE_DETECTION_ENABLED,
     )
 
     if fail_on_error and not MODEL_INTEGRITY_STATUS["ok"]:
@@ -315,6 +347,19 @@ def run_startup_validation(fail_on_error: bool = False) -> dict[str, Any]:
 
 
 run_startup_validation(fail_on_error=False)
+if not MODEL_INTEGRITY_STATUS["ok"]:
+    actual = ", ".join(MODEL_INTEGRITY_STATUS.get("actual_classes", [])) or "none"
+    expected = ", ".join(MODEL_INTEGRITY_STATUS.get("expected_classes", []))
+    LOGGER.warning(
+        "PPE detection disabled. Expected classes [%s] but model at %s provides [%s].",
+        expected,
+        MODEL_INTEGRITY_STATUS.get("model_path", PPE_MODEL_PATH),
+        actual,
+    )
+    if "person" in MODEL_INTEGRITY_STATUS.get("actual_classes", []):
+        LOGGER.warning(
+            "The configured PPE model looks like a general COCO model. Replace models/ppe.pt with a PPE-trained model."
+        )
 if (
     REQUIRE_VALID_PPE_MODEL
     and not MODEL_INTEGRITY_STATUS["ok"]
@@ -490,6 +535,7 @@ def _release_capture() -> None:
         if cap is not None:
             cap.release()
             cap = None
+    _set_metrics(source_ready=False)
 
 
 def _handle_shutdown(signum=None, frame=None) -> None:
@@ -513,6 +559,7 @@ def open_source(source: str, path: Optional[str] = None) -> bool:
     selected_source = source
     selected_path = "0"
     video_capture = None
+    failure_reason = None
 
     with PROCESS_LOCK:
         with CAP_LOCK:
@@ -525,17 +572,28 @@ def open_source(source: str, path: Optional[str] = None) -> bool:
                 video_capture = cv2.VideoCapture(0)
                 if not video_capture.isOpened():
                     video_capture.release()
+                    failure_reason = "camera_unavailable"
                     if RECORDED_VIDEO_PATH.exists():
                         video_capture = cv2.VideoCapture(str(RECORDED_VIDEO_PATH))
                         selected_source = "CAMERA_FALLBACK"
                         selected_path = str(RECORDED_VIDEO_PATH)
+                        failure_reason = None
             else:
                 if not path:
+                    _set_metrics(source_ready=False, source_error="missing_source_path")
                     return False
                 selected_path = path
                 video_capture = cv2.VideoCapture(path)
+                if not video_capture.isOpened():
+                    failure_reason = "source_unavailable"
 
             if video_capture is None or not video_capture.isOpened():
+                _set_metrics(
+                    source=source,
+                    source_path=selected_path,
+                    source_ready=False,
+                    source_error=failure_reason or "source_open_failed",
+                )
                 return False
 
             cap = video_capture
@@ -543,7 +601,7 @@ def open_source(source: str, path: Optional[str] = None) -> bool:
             SOURCE_PATH = selected_path
 
         _reset_runtime_state()
-        _set_metrics(source=SOURCE, source_path=SOURCE_PATH)
+        _set_metrics(source=SOURCE, source_path=SOURCE_PATH, source_ready=True, source_error=None)
     return True
 
 
@@ -553,6 +611,25 @@ def open_camera() -> bool:
 
 def open_recorded_video() -> bool:
     return open_source("RECORDED_VIDEO", str(RECORDED_VIDEO_PATH))
+
+
+def ensure_default_source() -> bool:
+    with CAP_LOCK:
+        if cap is not None:
+            return True
+
+    candidates = []
+    if AUTO_OPEN_SOURCE == "camera":
+        candidates = [open_camera, open_recorded_video]
+    elif AUTO_OPEN_SOURCE in {"recorded", "video"}:
+        candidates = [open_recorded_video, open_camera]
+    else:
+        candidates = [open_recorded_video, open_camera]
+
+    for loader in candidates:
+        if loader():
+            return True
+    return False
 
 
 def _bbox_intersection_area(box_a: tuple[int, int, int, int], box_b: tuple[int, int, int, int]) -> int:
@@ -640,8 +717,8 @@ def _run_person_detection(frame) -> list[tuple[int, int, int, int]]:
 
 
 def _run_ppe_detection(frame) -> Optional[list[tuple[int, tuple[int, int, int, int], float]]]:
-    if PPE_MODEL is None:
-        return []
+    if not PPE_DETECTION_ENABLED or PPE_MODEL is None:
+        return None
 
     started = time.perf_counter()
     try:
@@ -1129,6 +1206,11 @@ def index():
     return render_template("index.html")
 
 
+@app.route("/favicon.ico")
+def favicon():
+    return send_from_directory(app.static_folder, "favicon.svg", mimetype="image/svg+xml")
+
+
 @app.route("/camera")
 def camera():
     if not open_camera():
@@ -1168,6 +1250,8 @@ def upload_video():
 
 @app.route("/video_feed")
 def video_feed():
+    if not ensure_default_source():
+        return Response(status=503)
     return Response(generate_frames(), mimetype="multipart/x-mixed-replace; boundary=frame")
 
 
@@ -1202,5 +1286,5 @@ if __name__ == "__main__":
     run_startup_validation(fail_on_error=REQUIRE_VALID_PPE_MODEL)
     LIVE_METRICS["total_logged_violations"] = _count_existing_log_entries()
     get_dataset_summary(force=True)
-    open_camera()
-    app.run(host="0.0.0.0", port=8000, debug=False)
+    ensure_default_source()
+    app.run(host=SERVER_HOST, port=SERVER_PORT, debug=False)

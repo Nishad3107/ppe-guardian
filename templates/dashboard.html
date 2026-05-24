@@ -4,6 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>PPE Dashboard</title>
+  <link rel="icon" type="image/svg+xml" href="{{ url_for('static', filename='favicon.svg') }}">
   <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
 </head>
 <body>
@@ -26,6 +27,7 @@
       <div class="stat"><span>Violating Tracks</span><strong id="violating">0</strong></div>
       <div class="stat"><span>Total Violations Logged</span><strong id="total">0</strong></div>
     </section>
+    <p class="muted" id="pipelineStatus">Checking source and PPE pipeline...</p>
 
     <section class="grid-two">
       <article class="panel">
@@ -99,8 +101,13 @@
         document.getElementById('violating').textContent = data.violating_tracks ?? 0;
         document.getElementById('total').textContent = data.total_logged_violations ?? 0;
         document.getElementById('frameTime').textContent = `Last frame: ${formatTime(data.frame_time)}`;
+        document.getElementById('pipelineStatus').textContent = [
+          data.source_ready ? 'Source ready' : `Source unavailable: ${data.source_error ?? 'unknown'}`,
+          data.ppe_detection_enabled ? 'PPE model active' : 'PPE detection disabled: invalid or missing PPE model'
+        ].join(' | ');
       } catch (_) {
         document.getElementById('frameTime').textContent = 'Last frame: unavailable';
+        document.getElementById('pipelineStatus').textContent = 'Pipeline status unavailable';
       }
     }
 

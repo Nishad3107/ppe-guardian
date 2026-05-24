@@ -4,6 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>PPE Live Feed</title>
+  <link rel="icon" type="image/svg+xml" href="{{ url_for('static', filename='favicon.svg') }}">
   <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
 </head>
 <body>
@@ -37,6 +38,7 @@
           <div class="stat"><span>Total Logged</span><strong id="total">0</strong></div>
         </div>
         <p class="muted" id="frameTime">Waiting for first frame...</p>
+        <p class="muted" id="pipelineStatus">Checking source and PPE pipeline...</p>
       </article>
     </section>
   </main>
@@ -54,8 +56,13 @@
         document.getElementById('frameTime').textContent = data.frame_time
           ? `Last frame: ${new Date(data.frame_time).toLocaleString()}`
           : 'Waiting for first frame...';
+        document.getElementById('pipelineStatus').textContent = [
+          data.source_ready ? 'Source ready' : `Source unavailable: ${data.source_error ?? 'unknown'}`,
+          data.ppe_detection_enabled ? 'PPE model active' : 'PPE detection disabled: invalid or missing PPE model'
+        ].join(' | ');
       } catch (_) {
         document.getElementById('frameTime').textContent = 'Unable to fetch live metrics.';
+        document.getElementById('pipelineStatus').textContent = 'Unable to fetch pipeline status.';
       }
     }
 

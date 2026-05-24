@@ -1,0 +1,9 @@
+{
+  "name": "ppe-guardian",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Dev launcher for the PPE Guardian Flask app",
+  "scripts": {
+    "dev": "node scripts/dev.js"
+  }
+}
