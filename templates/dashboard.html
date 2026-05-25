@@ -33,9 +33,9 @@
       <article class="panel">
         <div class="panel-head">
           <h2>Live Feed</h2>
-          <a class="btn btn-secondary" href="/camera">Open in Camera View</a>
+          <a class="btn btn-secondary" href="{{ camera_view_url if camera_view_url is defined else '/camera' }}">Open in Camera View</a>
         </div>
-        <img class="stream" src="/video_feed" alt="Live PPE feed">
+        <img class="stream" src="{{ feed_url }}" alt="Live PPE feed">
         <p class="muted" id="frameTime">Last frame: -</p>
       </article>
 
@@ -74,6 +74,8 @@
   </main>
 
   <script>
+    const metricsUrl = {{ metrics_url|tojson }};
+    const logsUrl = {{ logs_url|tojson }};
     function formatTime(value) {
       if (!value) return '-';
       const d = new Date(value);
@@ -92,7 +94,7 @@
 
     async function refreshMetrics() {
       try {
-        const res = await fetch('/api/metrics');
+        const res = await fetch(metricsUrl);
         const data = await res.json();
 
         document.getElementById('source').textContent = `${data.source ?? '-'} (${data.source_path ?? '-'})`;
@@ -114,7 +116,7 @@
     async function refreshLogs() {
       const tbody = document.getElementById('logRows');
       try {
-        const res = await fetch('/api/logs?limit=50');
+        const res = await fetch(`${logsUrl}${logsUrl.includes('?') ? '&' : '?'}limit=50`);
         const data = await res.json();
         const logs = data.logs ?? [];
 

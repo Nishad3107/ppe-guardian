@@ -15,7 +15,7 @@
       <a href="/camera">Live Camera</a>
       <a href="/recorded">Recorded Video</a>
       <a href="/upload">Upload Video</a>
-      <a href="/dashboard">Dashboard</a>
+      <a href="{{ dashboard_url }}">Dashboard</a>
     </nav>
   </header>
 
@@ -26,7 +26,7 @@
           <h2>{{ source }}</h2>
           <span class="badge">{{ source_path }}</span>
         </div>
-        <img class="stream" src="/video_feed" alt="Live PPE Detection Stream">
+        <img class="stream" src="{{ feed_url }}" alt="Live PPE Detection Stream">
       </article>
 
       <article class="panel">
@@ -44,9 +44,10 @@
   </main>
 
   <script>
+    const metricsUrl = {{ metrics_url|tojson }};
     async function refreshMetrics() {
       try {
-        const res = await fetch('/api/metrics');
+        const res = await fetch(metricsUrl);
         const data = await res.json();
 
         document.getElementById('people').textContent = data.people_detected ?? 0;

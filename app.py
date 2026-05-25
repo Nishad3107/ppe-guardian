@@ -10,8 +10,10 @@ import signal
 import threading
 import time
 from collections import deque
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
+from uuid import uuid4
 
 import cv2
 import numpy as np
@@ -240,47 +242,46 @@ MODEL_INTEGRITY_STATUS: dict[str, Any] = {
 PPE_CLASS_MAP, PPE_CLASS_ITEM_MAP = _build_ppe_class_maps(PPE_MODEL)
 PPE_DETECTION_ENABLED = PPE_MODEL is not None
 LAST_PERF_WARNING_BY_STAGE: dict[str, float] = {}
-
-# Use external embeddings so DeepSORT does not require optional embedder deps at init time.
-TRACKER = DeepSort(max_age=30, embedder=None)
-
-cap = None
-SOURCE = "CAMERA"
-SOURCE_PATH = "0"
-CAP_LOCK = threading.Lock()
-PROCESS_LOCK = threading.Lock()
-STATE_LOCK = threading.Lock()
 SHUTDOWN_EVENT = threading.Event()
+JOBS_LOCK = threading.Lock()
+JOBS: dict[str, "SourceJob"] = {}
+ACTIVE_JOB_ID: Optional[str] = None
 
-TRACK_CACHE: dict[int, dict[str, Any]] = {}
-LAST_VIOLATION_BY_KEY: dict[str, float] = {}
-FRAME_COUNT = 0
 
-LIVE_METRICS = {
-    "source": SOURCE,
-    "source_path": SOURCE_PATH,
-    "frame_time": None,
-    "people_detected": 0,
-    "active_tracks": 0,
-    "violating_tracks": 0,
-    "total_logged_violations": 0,
-    "last_violation": None,
-    "fps": 0.0,
-    "ppe_supported_items": _supported_ppe_items(PPE_CLASS_MAP),
-    "ppe_model_path": PPE_MODEL_USED_PATH or str(PPE_MODEL_PATH),
-    "ppe_model_source": PPE_MODEL_SOURCE,
-    "model_integrity_ok": False,
-    "model_missing_classes": [],
-    "ppe_detection_enabled": PPE_DETECTION_ENABLED,
-    "fps_overlay_enabled": FPS_OVERLAY_ENABLED,
-    "source_ready": False,
-    "source_error": None,
-}
-METRICS_LOCK = threading.Lock()
+@dataclass
+class SourceJob:
+    job_id: str
+    requested_source: str
+    requested_path: str
+    source: str
+    source_path: str
+    source_ready: bool = False
+    source_error: Optional[str] = None
+    latest_frame_jpeg: Optional[bytes] = None
+    latest_frame_seq: int = 0
+    latest_frame_time: Optional[str] = None
+    people_detected: int = 0
+    active_tracks: int = 0
+    violating_tracks: int = 0
+    total_logged_violations: int = 0
+    last_violation: Optional[dict[str, Any]] = None
+    fps: float = 0.0
+    tracker: DeepSort = field(default_factory=lambda: DeepSort(max_age=30, embedder=None))
+    track_cache: dict[int, dict[str, Any]] = field(default_factory=dict)
+    last_violation_by_key: dict[str, float] = field(default_factory=dict)
+    frame_count: int = 0
+    stop_event: threading.Event = field(default_factory=threading.Event)
+    thread: Optional[threading.Thread] = None
+    lock: threading.Lock = field(default_factory=threading.Lock)
+    condition: threading.Condition = field(init=False)
+
+    def __post_init__(self) -> None:
+        self.condition = threading.Condition(self.lock)
 
 DATASET_CACHE = {"last_scan": 0.0, "summary": []}
 DATASET_LOCK = threading.Lock()
 DATASET_SCAN_INTERVAL_SECONDS = 60
+LOG_COUNT_LOCK = threading.Lock()
 
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
@@ -295,14 +296,63 @@ def _count_existing_log_entries() -> int:
         return sum(1 for line in f if line.strip())
 
 
-def _set_metrics(**updates: Any) -> None:
-    with METRICS_LOCK:
-        LIVE_METRICS.update(updates)
+GLOBAL_LOG_COUNT = _count_existing_log_entries()
 
 
-def _snapshot_metrics() -> dict[str, Any]:
-    with METRICS_LOCK:
-        return dict(LIVE_METRICS)
+def _job_base_metrics(job: SourceJob) -> dict[str, Any]:
+    return {
+        "job_id": job.job_id,
+        "source": job.source,
+        "source_path": job.source_path,
+        "frame_time": job.latest_frame_time,
+        "people_detected": job.people_detected,
+        "active_tracks": job.active_tracks,
+        "violating_tracks": job.violating_tracks,
+        "total_logged_violations": GLOBAL_LOG_COUNT,
+        "last_violation": job.last_violation,
+        "fps": job.fps,
+        "ppe_supported_items": _supported_ppe_items(PPE_CLASS_MAP) if PPE_DETECTION_ENABLED else [],
+        "ppe_model_path": MODEL_INTEGRITY_STATUS.get("model_path", PPE_MODEL_USED_PATH or str(PPE_MODEL_PATH)),
+        "ppe_model_source": MODEL_INTEGRITY_STATUS.get("model_source", PPE_MODEL_SOURCE),
+        "model_integrity_ok": MODEL_INTEGRITY_STATUS["ok"],
+        "model_missing_classes": MODEL_INTEGRITY_STATUS.get("missing_classes", []),
+        "ppe_detection_enabled": PPE_DETECTION_ENABLED,
+        "fps_overlay_enabled": FPS_OVERLAY_ENABLED,
+        "source_ready": job.source_ready,
+        "source_error": job.source_error,
+    }
+
+
+def _empty_metrics(job_id: Optional[str] = None) -> dict[str, Any]:
+    return {
+        "job_id": job_id,
+        "source": "UNINITIALIZED",
+        "source_path": "",
+        "frame_time": None,
+        "people_detected": 0,
+        "active_tracks": 0,
+        "violating_tracks": 0,
+        "total_logged_violations": 0,
+        "last_violation": None,
+        "fps": 0.0,
+        "ppe_supported_items": _supported_ppe_items(PPE_CLASS_MAP) if PPE_DETECTION_ENABLED else [],
+        "ppe_model_path": MODEL_INTEGRITY_STATUS.get("model_path", PPE_MODEL_USED_PATH or str(PPE_MODEL_PATH)),
+        "ppe_model_source": MODEL_INTEGRITY_STATUS.get("model_source", PPE_MODEL_SOURCE),
+        "model_integrity_ok": MODEL_INTEGRITY_STATUS["ok"],
+        "model_missing_classes": MODEL_INTEGRITY_STATUS.get("missing_classes", []),
+        "ppe_detection_enabled": PPE_DETECTION_ENABLED,
+        "fps_overlay_enabled": FPS_OVERLAY_ENABLED,
+        "source_ready": False,
+        "source_error": "job_not_found",
+    }
+
+
+def _snapshot_metrics(job_id: Optional[str] = None) -> dict[str, Any]:
+    job = _resolve_job(job_id)
+    if job is None:
+        return _empty_metrics(job_id)
+    with job.lock:
+        return dict(_job_base_metrics(job))
 
 
 def run_startup_validation(fail_on_error: bool = False) -> dict[str, Any]:
@@ -332,14 +382,6 @@ def run_startup_validation(fail_on_error: bool = False) -> dict[str, Any]:
 
     PPE_CLASS_MAP, PPE_CLASS_ITEM_MAP = _build_ppe_class_maps(PPE_MODEL)
     PPE_DETECTION_ENABLED = MODEL_INTEGRITY_STATUS["ok"] and PPE_MODEL is not None
-    _set_metrics(
-        model_integrity_ok=MODEL_INTEGRITY_STATUS["ok"],
-        ppe_supported_items=_supported_ppe_items(PPE_CLASS_MAP) if PPE_DETECTION_ENABLED else [],
-        model_missing_classes=MODEL_INTEGRITY_STATUS.get("missing_classes", []),
-        ppe_model_path=MODEL_INTEGRITY_STATUS.get("model_path", PPE_MODEL_USED_PATH or str(PPE_MODEL_PATH)),
-        ppe_model_source=MODEL_INTEGRITY_STATUS.get("model_source", PPE_MODEL_SOURCE),
-        ppe_detection_enabled=PPE_DETECTION_ENABLED,
-    )
 
     if fail_on_error and not MODEL_INTEGRITY_STATUS["ok"]:
         raise SystemExit("Startup aborted due to model integrity failure")
@@ -520,27 +562,12 @@ def get_dataset_summary(force: bool = False) -> list[dict[str, Any]]:
         return DATASET_CACHE["summary"]
 
 
-def _reset_runtime_state() -> None:
-    global FRAME_COUNT, TRACKER
-    with STATE_LOCK:
-        TRACKER = DeepSort(max_age=30, embedder=None)
-        TRACK_CACHE.clear()
-        LAST_VIOLATION_BY_KEY.clear()
-        FRAME_COUNT = 0
-
-
-def _release_capture() -> None:
-    global cap
-    with CAP_LOCK:
-        if cap is not None:
-            cap.release()
-            cap = None
-    _set_metrics(source_ready=False)
-
-
 def _handle_shutdown(signum=None, frame=None) -> None:
     SHUTDOWN_EVENT.set()
-    _release_capture()
+    with JOBS_LOCK:
+        jobs = list(JOBS.values())
+    for job in jobs:
+        job.stop_event.set()
 
 
 def _source_label(source: str) -> str:
@@ -553,83 +580,126 @@ def _source_label(source: str) -> str:
     return labels.get(source, source.replace("_", " ").title())
 
 
-def open_source(source: str, path: Optional[str] = None) -> bool:
-    global cap, SOURCE, SOURCE_PATH
-
-    selected_source = source
-    selected_path = "0"
-    video_capture = None
-    failure_reason = None
-
-    with PROCESS_LOCK:
-        with CAP_LOCK:
-            if cap is not None:
-                cap.release()
-                cap = None
-
-            if source == "CAMERA":
-                selected_path = "0"
-                video_capture = cv2.VideoCapture(0)
-                if not video_capture.isOpened():
-                    video_capture.release()
-                    failure_reason = "camera_unavailable"
-                    if RECORDED_VIDEO_PATH.exists():
-                        video_capture = cv2.VideoCapture(str(RECORDED_VIDEO_PATH))
-                        selected_source = "CAMERA_FALLBACK"
-                        selected_path = str(RECORDED_VIDEO_PATH)
-                        failure_reason = None
-            else:
-                if not path:
-                    _set_metrics(source_ready=False, source_error="missing_source_path")
-                    return False
-                selected_path = path
-                video_capture = cv2.VideoCapture(path)
-                if not video_capture.isOpened():
-                    failure_reason = "source_unavailable"
-
-            if video_capture is None or not video_capture.isOpened():
-                _set_metrics(
-                    source=source,
-                    source_path=selected_path,
-                    source_ready=False,
-                    source_error=failure_reason or "source_open_failed",
-                )
-                return False
-
-            cap = video_capture
-            SOURCE = selected_source
-            SOURCE_PATH = selected_path
-
-        _reset_runtime_state()
-        _set_metrics(source=SOURCE, source_path=SOURCE_PATH, source_ready=True, source_error=None)
-    return True
+def _resolve_job(job_id: Optional[str] = None) -> Optional[SourceJob]:
+    with JOBS_LOCK:
+        if job_id and job_id in JOBS:
+            return JOBS[job_id]
+        if ACTIVE_JOB_ID and ACTIVE_JOB_ID in JOBS:
+            return JOBS[ACTIVE_JOB_ID]
+        return next(iter(JOBS.values()), None)
 
 
-def open_camera() -> bool:
-    return open_source("CAMERA")
+def _set_active_job(job_id: str) -> None:
+    global ACTIVE_JOB_ID
+    with JOBS_LOCK:
+        if job_id in JOBS:
+            ACTIVE_JOB_ID = job_id
 
 
-def open_recorded_video() -> bool:
-    return open_source("RECORDED_VIDEO", str(RECORDED_VIDEO_PATH))
+def _job_stream_urls(job: SourceJob) -> dict[str, str]:
+    return {
+        "feed_url": url_for("video_feed_job", job_id=job.job_id),
+        "metrics_url": url_for("api_metrics", job_id=job.job_id),
+        "dashboard_url": url_for("dashboard", job_id=job.job_id),
+        "logs_url": url_for("api_logs", job_id=job.job_id),
+    }
 
 
-def ensure_default_source() -> bool:
-    with CAP_LOCK:
-        if cap is not None:
-            return True
+def _await_job_start(job: SourceJob, timeout_seconds: float = 1.5) -> None:
+    deadline = time.time() + timeout_seconds
+    with job.condition:
+        while (
+            job.latest_frame_jpeg is None
+            and job.source_error is None
+            and not job.source_ready
+            and time.time() < deadline
+        ):
+            remaining = max(deadline - time.time(), 0.0)
+            if remaining <= 0:
+                break
+            job.condition.wait(timeout=remaining)
 
-    candidates = []
-    if AUTO_OPEN_SOURCE == "camera":
-        candidates = [open_camera, open_recorded_video]
-    elif AUTO_OPEN_SOURCE in {"recorded", "video"}:
-        candidates = [open_recorded_video, open_camera]
+
+def _create_job(job_id: str, source: str, path: str) -> SourceJob:
+    return SourceJob(
+        job_id=job_id,
+        requested_source=source,
+        requested_path=path,
+        source=source,
+        source_path=path,
+        total_logged_violations=_count_existing_log_entries(),
+    )
+
+
+def _open_capture_for_job(job: SourceJob) -> tuple[Optional[cv2.VideoCapture], str, str, Optional[str]]:
+    selected_source = job.requested_source
+    selected_path = job.requested_path
+
+    if job.requested_source == "CAMERA":
+        cap = cv2.VideoCapture(0)
+        if cap.isOpened():
+            return cap, "CAMERA", "0", None
+        cap.release()
+        if RECORDED_VIDEO_PATH.exists():
+            cap = cv2.VideoCapture(str(RECORDED_VIDEO_PATH))
+            if cap.isOpened():
+                return cap, "CAMERA_FALLBACK", str(RECORDED_VIDEO_PATH), None
+        return None, selected_source, "0", "camera_unavailable"
+
+    if not selected_path:
+        return None, selected_source, selected_path, "missing_source_path"
+
+    cap = cv2.VideoCapture(selected_path)
+    if not cap.isOpened():
+        return None, selected_source, selected_path, "source_unavailable"
+    return cap, selected_source, selected_path, None
+
+
+def _ensure_job(source: str, path: Optional[str] = None) -> SourceJob:
+    if source == "CAMERA":
+        job_id = "camera"
+        requested_path = "0"
+    elif source == "RECORDED_VIDEO":
+        job_id = "recorded"
+        requested_path = path or str(RECORDED_VIDEO_PATH)
+    elif source == "UPLOADED_VIDEO":
+        job_id = f"upload-{uuid4().hex[:12]}"
+        requested_path = path or ""
     else:
-        candidates = [open_recorded_video, open_camera]
+        raise ValueError(f"Unsupported source: {source}")
 
-    for loader in candidates:
-        if loader():
-            return True
-    return False
+    with JOBS_LOCK:
+        existing = JOBS.get(job_id)
+        if existing and existing.thread and existing.thread.is_alive():
+            return existing
+        job = _create_job(job_id=job_id, source=source, path=requested_path)
+        JOBS[job_id] = job
+
+    thread = threading.Thread(target=_job_worker, args=(job,), daemon=True, name=f"job-{job_id}")
+    job.thread = thread
+    thread.start()
+    _set_active_job(job.job_id)
+    return job
+
+
+def _ensure_uploaded_job(path: str) -> SourceJob:
+    job = _create_job(job_id=f"upload-{uuid4().hex[:12]}", source="UPLOADED_VIDEO", path=path)
+    with JOBS_LOCK:
+        JOBS[job.job_id] = job
+    thread = threading.Thread(target=_job_worker, args=(job,), daemon=True, name=f"job-{job.job_id}")
+    job.thread = thread
+    thread.start()
+    _set_active_job(job.job_id)
+    return job
+
+
+def ensure_default_job() -> Optional[SourceJob]:
+    existing = _resolve_job()
+    if existing is not None:
+        return existing
+    if AUTO_OPEN_SOURCE == "camera":
+        return _ensure_job("CAMERA")
+    return _ensure_job("RECORDED_VIDEO", str(RECORDED_VIDEO_PATH))
 
 
 def _bbox_intersection_area(box_a: tuple[int, int, int, int], box_b: tuple[int, int, int, int]) -> int:
@@ -673,7 +743,7 @@ def _bbox_center_inside(inner_box: tuple[int, int, int, int], outer_box: tuple[i
     return ox1 <= cx <= ox2 and oy1 <= cy <= oy2
 
 
-def _monitor_inference_time(stage: str, duration_seconds: float) -> None:
+def _monitor_inference_time(stage: str, duration_seconds: float, source: str) -> None:
     if duration_seconds <= MAX_INFERENCE_TIME_SECONDS:
         return
     now = time.time()
@@ -688,7 +758,7 @@ def _monitor_inference_time(stage: str, duration_seconds: float) -> None:
             "stage": stage,
             "duration_ms": round(duration_seconds * 1000.0, 2),
             "threshold_ms": round(MAX_INFERENCE_TIME_SECONDS * 1000.0, 2),
-            "source": SOURCE,
+            "source": source,
         },
     )
 
@@ -701,7 +771,7 @@ def _run_person_detection(frame) -> list[tuple[int, int, int, int]]:
     except Exception:
         return person_boxes
     finally:
-        _monitor_inference_time("person_detection", time.perf_counter() - started)
+        _monitor_inference_time("person_detection", time.perf_counter() - started, "PERSON_MODEL")
 
     names = _names_to_dict(getattr(PERSON_MODEL, "names", {}))
     if result.boxes is None:
@@ -726,7 +796,7 @@ def _run_ppe_detection(frame) -> Optional[list[tuple[int, tuple[int, int, int, i
     except Exception:
         return None
     finally:
-        _monitor_inference_time("ppe_detection", time.perf_counter() - started)
+        _monitor_inference_time("ppe_detection", time.perf_counter() - started, "PPE_MODEL")
 
     detections: list[tuple[int, tuple[int, int, int, int], float]] = []
     if result.boxes is None:
@@ -828,7 +898,9 @@ def _empty_frame_evidence() -> dict[str, dict[str, Any]]:
     }
 
 
-def _update_worker_id(track_state: dict[str, Any], track_box: tuple[int, int, int, int], now_ts: float) -> str:
+def _update_worker_id(
+    track_state: dict[str, Any], track_box: tuple[int, int, int, int], now_ts: float, source: str
+) -> str:
     x1, y1, x2, y2 = track_box
     cx = int((x1 + x2) / 2)
     cy = int((y1 + y2) / 2)
@@ -840,7 +912,7 @@ def _update_worker_id(track_state: dict[str, Any], track_box: tuple[int, int, in
 
     time_bucket = int(now_ts // max(TRACK_HASH_TIME_WINDOW_SECONDS, 1))
     payload = {
-        "source": SOURCE,
+        "source": source,
         "bucket": time_bucket,
         "trajectory": list(trajectory),
     }
@@ -890,9 +962,9 @@ def _apply_temporal_filter(
     return smoothed_status, smoothed_conf
 
 
-def _build_violation_fingerprint(worker_id: str, missing_items: list[str]) -> str:
+def _build_violation_fingerprint(source: str, worker_id: str, missing_items: list[str]) -> str:
     violation_type = ",".join(sorted(f"missing_{item}" for item in missing_items))
-    return f"{SOURCE}|{worker_id}|{violation_type}"
+    return f"{source}|{worker_id}|{violation_type}"
 
 
 def _violation_confidence(missing_items: list[str], item_conf: dict[str, float]) -> float:
@@ -902,21 +974,21 @@ def _violation_confidence(missing_items: list[str], item_conf: dict[str, float])
     return round(sum(confidences) / max(len(confidences), 1), 4)
 
 
-def _cleanup_stale_state(frame_number: int, active_track_ids: set[int]) -> None:
+def _cleanup_stale_state(job: SourceJob, frame_number: int, active_track_ids: set[int]) -> None:
     stale_track_ids = [
         track_id
-        for track_id, state in TRACK_CACHE.items()
+        for track_id, state in job.track_cache.items()
         if (track_id not in active_track_ids) and (frame_number - int(state.get("last_frame", 0)) > TRACK_STALE_FRAME_LIMIT)
     ]
     for track_id in stale_track_ids:
-        TRACK_CACHE.pop(track_id, None)
+        job.track_cache.pop(track_id, None)
 
     now = time.time()
     stale_violation_keys = [
-        key for key, ts in LAST_VIOLATION_BY_KEY.items() if now - ts > VIOLATION_CACHE_TTL_SECONDS
+        key for key, ts in job.last_violation_by_key.items() if now - ts > VIOLATION_CACHE_TTL_SECONDS
     ]
     for key in stale_violation_keys:
-        LAST_VIOLATION_BY_KEY.pop(key, None)
+        job.last_violation_by_key.pop(key, None)
 
 
 def _apply_frame_rate_limit(frame_started_at: float) -> None:
@@ -929,6 +1001,7 @@ def _apply_frame_rate_limit(frame_started_at: float) -> None:
 
 
 def write_violation(
+    job: SourceJob,
     track_id: int,
     worker_id: str,
     missing_items: list[str],
@@ -938,13 +1011,14 @@ def write_violation(
     timestamp = datetime.datetime.now(datetime.UTC).isoformat()
     violation_type = ",".join(sorted(f"missing_{item}" for item in missing_items))
     payload = {
+        "job_id": job.job_id,
         "worker_id": worker_id,
         "violation_type": violation_type,
         "confidence": round(float(confidence), 4),
         "timestamp": timestamp,
-        "camera_source": SOURCE,
-        "source": SOURCE,
-        "source_path": SOURCE_PATH,
+        "camera_source": job.source,
+        "source": job.source,
+        "source_path": job.source_path,
         "id": int(track_id),
         "missing": missing_items,
         "status": ppe_status,
@@ -955,9 +1029,11 @@ def write_violation(
 
     _log_structured(logging.INFO, "violation_logged", payload)
 
-    with METRICS_LOCK:
-        LIVE_METRICS["total_logged_violations"] += 1
-        LIVE_METRICS["last_violation"] = payload
+    global GLOBAL_LOG_COUNT
+    with LOG_COUNT_LOCK:
+        GLOBAL_LOG_COUNT += 1
+    with job.lock:
+        job.last_violation = payload
 
 
 def parse_violation_line(line: str) -> Optional[dict[str, Any]]:
@@ -973,6 +1049,7 @@ def parse_violation_line(line: str) -> Optional[dict[str, Any]]:
             missing = [k for k, v in status.items() if not v]
 
         return {
+            "job_id": parsed.get("job_id"),
             "worker_id": parsed.get("worker_id"),
             "violation_type": parsed.get("violation_type"),
             "confidence": parsed.get("confidence", 0.0),
@@ -998,6 +1075,7 @@ def parse_violation_line(line: str) -> Optional[dict[str, Any]]:
         status = {}
 
     return {
+        "job_id": None,
         "worker_id": None,
         "violation_type": ",".join(sorted(f"missing_{item}" for item, ok in status.items() if not ok)),
         "confidence": 0.0,
@@ -1011,7 +1089,7 @@ def parse_violation_line(line: str) -> Optional[dict[str, Any]]:
     }
 
 
-def get_recent_violations(limit: int = 100) -> list[dict[str, Any]]:
+def get_recent_violations(limit: int = 100, job_id: Optional[str] = None) -> list[dict[str, Any]]:
     log_path = VIOLATIONS_LOG_PATH
     if not log_path.exists():
         return []
@@ -1024,181 +1102,191 @@ def get_recent_violations(limit: int = 100) -> list[dict[str, Any]]:
     parsed: list[dict[str, Any]] = []
     for line in reversed(lines):
         item = parse_violation_line(line)
-        if item is not None:
+        if item is not None and (job_id is None or item.get("job_id") == job_id):
             parsed.append(item)
         if len(parsed) >= limit:
             break
     return parsed
 
 
-def generate_frames():
-    global FRAME_COUNT
+def _job_worker(job: SourceJob) -> None:
+    capture, actual_source, actual_path, open_error = _open_capture_for_job(job)
+    with job.condition:
+        job.source = actual_source
+        job.source_path = actual_path
+        job.source_ready = capture is not None and open_error is None
+        job.source_error = open_error
+        job.condition.notify_all()
 
-    while not SHUTDOWN_EVENT.is_set():
-        frame_started_at = time.perf_counter()
-        stream_chunk = None
-        should_sleep = False
+    if capture is None:
+        return
 
-        with PROCESS_LOCK:
-            with CAP_LOCK:
-                current_cap = cap
-                current_source = SOURCE
+    try:
+        while not SHUTDOWN_EVENT.is_set() and not job.stop_event.is_set():
+            frame_started_at = time.perf_counter()
+            ok, frame = capture.read()
+            if not ok:
+                if job.source in {"RECORDED_VIDEO", "UPLOADED_VIDEO", "CAMERA_FALLBACK"}:
+                    capture.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                    time.sleep(0.01)
+                    continue
+                time.sleep(0.05)
+                continue
 
-            if current_cap is None:
-                should_sleep = True
-            else:
-                ok, frame = current_cap.read()
-                if not ok:
-                    if current_source in {"RECORDED_VIDEO", "UPLOADED_VIDEO", "CAMERA_FALLBACK"}:
-                        current_cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                    else:
-                        should_sleep = True
+            with job.lock:
+                job.frame_count += 1
+                frame_number = job.frame_count
+
+            person_boxes = _run_person_detection(frame)
+            detections = [
+                ([x1, y1, x2 - x1, y2 - y1], 0.9, "person")
+                for (x1, y1, x2, y2) in person_boxes
+            ]
+            embeds = _build_embeddings(frame, detections)
+            tracks = job.tracker.update_tracks(detections, embeds=embeds)
+
+            ppe_detections = _run_ppe_detection(frame)
+            ppe_inference_ok = ppe_detections is not None
+
+            confirmed_track_boxes: dict[int, tuple[int, int, int, int]] = {}
+            for track in tracks:
+                if not track.is_confirmed():
+                    continue
+                track_id = int(track.track_id)
+                confirmed_track_boxes[track_id] = tuple(map(int, track.to_ltrb()))
+
+            evidence_from_ppe = {}
+            if ppe_inference_ok:
+                evidence_from_ppe = _associate_ppe_to_tracks(confirmed_track_boxes, ppe_detections or [])
+
+            detected_people = len(person_boxes)
+            active_tracks = 0
+            violating_tracks = 0
+            active_track_ids: set[int] = set()
+            now_ts = time.time()
+
+            for track_id, (x1, y1, x2, y2) in confirmed_track_boxes.items():
+                active_tracks += 1
+                active_track_ids.add(track_id)
+                track_state = job.track_cache.get(track_id)
+                if track_state is None:
+                    track_state = _new_track_state(frame_number)
+
+                should_refresh = frame_number - int(track_state.get("last_frame", 0)) >= PPE_REFRESH_FRAMES
+
+                frame_evidence = _empty_frame_evidence()
+                if should_refresh and ppe_inference_ok:
+                    frame_evidence = evidence_from_ppe.get(track_id, _empty_frame_evidence())
+                smoothed_status, smoothed_confidence = _apply_temporal_filter(track_state, frame_evidence)
+                worker_id = _update_worker_id(track_state, (x1, y1, x2, y2), now_ts, job.source)
+
+                track_state["last_frame"] = frame_number
+                job.track_cache[track_id] = track_state
+
+                if ppe_inference_ok:
+                    ppe_status = smoothed_status
+                    ppe_confidence = smoothed_confidence
                 else:
-                    with STATE_LOCK:
-                        FRAME_COUNT += 1
-                        frame_number = FRAME_COUNT
+                    ppe_status = dict(track_state.get("status", {item: False for item in PPE_ITEMS}))
+                    ppe_confidence = dict(track_state.get("confidence", {item: 0.0 for item in PPE_ITEMS}))
 
-                    person_boxes = _run_person_detection(frame)
-                    detections = [
-                        ([x1, y1, x2 - x1, y2 - y1], 0.9, "person")
-                        for (x1, y1, x2, y2) in person_boxes
-                    ]
-                    embeds = _build_embeddings(frame, detections)
-                    tracks = TRACKER.update_tracks(detections, embeds=embeds)
+                missing_items = [item for item, present in ppe_status.items() if not present]
+                is_violation = bool(missing_items)
+                if is_violation:
+                    violating_tracks += 1
 
-                    ppe_detections = _run_ppe_detection(frame)
-                    ppe_inference_ok = ppe_detections is not None
+                box_color = (0, 0, 255) if is_violation else (0, 200, 0)
+                cv2.rectangle(frame, (x1, y1), (x2, y2), box_color, 2)
+                cv2.putText(
+                    frame,
+                    f"ID {track_id}",
+                    (x1, max(20, y1 - 8)),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6,
+                    box_color,
+                    2,
+                )
 
-                    confirmed_track_boxes: dict[int, tuple[int, int, int, int]] = {}
-                    for track in tracks:
-                        if not track.is_confirmed():
-                            continue
-                        track_id = int(track.track_id)
-                        confirmed_track_boxes[track_id] = tuple(map(int, track.to_ltrb()))
-
-                    evidence_from_ppe = {}
-                    if ppe_inference_ok:
-                        evidence_from_ppe = _associate_ppe_to_tracks(confirmed_track_boxes, ppe_detections or [])
-
-                    detected_people = len(person_boxes)
-                    active_tracks = 0
-                    violating_tracks = 0
-                    active_track_ids: set[int] = set()
-                    now_ts = time.time()
-
-                    for track_id, (x1, y1, x2, y2) in confirmed_track_boxes.items():
-                        active_tracks += 1
-                        active_track_ids.add(track_id)
-                        track_state = TRACK_CACHE.get(track_id)
-                        if track_state is None:
-                            track_state = _new_track_state(frame_number)
-
-                        should_refresh = (
-                            frame_number - int(track_state.get("last_frame", 0)) >= PPE_REFRESH_FRAMES
-                        )
-
-                        frame_evidence = _empty_frame_evidence()
-                        if should_refresh and ppe_inference_ok:
-                            frame_evidence = evidence_from_ppe.get(track_id, _empty_frame_evidence())
-                        smoothed_status, smoothed_confidence = _apply_temporal_filter(track_state, frame_evidence)
-                        worker_id = _update_worker_id(track_state, (x1, y1, x2, y2), now_ts)
-
-                        track_state["last_frame"] = frame_number
-                        TRACK_CACHE[track_id] = track_state
-
-                        if ppe_inference_ok:
-                            ppe_status = smoothed_status
-                            ppe_confidence = smoothed_confidence
-                        else:
-                            ppe_status = dict(track_state.get("status", {item: False for item in PPE_ITEMS}))
-                            ppe_confidence = dict(track_state.get("confidence", {item: 0.0 for item in PPE_ITEMS}))
-
-                        missing_items = [item for item, present in ppe_status.items() if not present]
-                        is_violation = bool(missing_items)
-                        if is_violation:
-                            violating_tracks += 1
-
-                        box_color = (0, 0, 255) if is_violation else (0, 200, 0)
-                        cv2.rectangle(frame, (x1, y1), (x2, y2), box_color, 2)
-                        cv2.putText(
-                            frame,
-                            f"ID {track_id}",
-                            (x1, max(20, y1 - 8)),
-                            cv2.FONT_HERSHEY_SIMPLEX,
-                            0.6,
-                            box_color,
-                            2,
-                        )
-
-                        text_y = y1 + 20
-                        for item in PPE_ITEMS:
-                            present = ppe_status[item]
-                            color = (0, 200, 0) if present else (0, 0, 255)
-                            cv2.putText(
-                                frame,
-                                f"{item.upper()}: {'OK' if present else 'NO'}",
-                                (x1, text_y),
-                                cv2.FONT_HERSHEY_SIMPLEX,
-                                0.5,
-                                color,
-                                2,
-                            )
-                            text_y += 18
-
-                        if is_violation:
-                            fingerprint = _build_violation_fingerprint(worker_id, missing_items)
-                            now = time.time()
-                            last_time = LAST_VIOLATION_BY_KEY.get(fingerprint, 0.0)
-                            if now - last_time >= VIOLATION_DEDUP_SECONDS:
-                                LAST_VIOLATION_BY_KEY[fingerprint] = now
-                                write_violation(
-                                    track_id=track_id,
-                                    worker_id=worker_id,
-                                    missing_items=missing_items,
-                                    ppe_status=ppe_status,
-                                    confidence=_violation_confidence(missing_items, ppe_confidence),
-                                )
-
-                    _cleanup_stale_state(frame_number, active_track_ids)
-
-                    elapsed = max(time.perf_counter() - frame_started_at, 1e-6)
-                    fps_value = round(1.0 / elapsed, 2)
-                    if FPS_OVERLAY_ENABLED:
-                        cv2.putText(
-                            frame,
-                            f"FPS: {fps_value}",
-                            (12, 28),
-                            cv2.FONT_HERSHEY_SIMPLEX,
-                            0.7,
-                            (255, 230, 0),
-                            2,
-                        )
-                    _set_metrics(
-                        source=SOURCE,
-                        source_path=SOURCE_PATH,
-                        frame_time=datetime.datetime.now(datetime.UTC).isoformat(),
-                        people_detected=detected_people,
-                        active_tracks=active_tracks,
-                        violating_tracks=violating_tracks,
-                        fps=fps_value,
+                text_y = y1 + 20
+                for item in PPE_ITEMS:
+                    present = ppe_status[item]
+                    color = (0, 200, 0) if present else (0, 0, 255)
+                    cv2.putText(
+                        frame,
+                        f"{item.upper()}: {'OK' if present else 'NO'}",
+                        (x1, text_y),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.5,
+                        color,
+                        2,
                     )
+                    text_y += 18
 
-                    ok, buffer = cv2.imencode(".jpg", frame)
-                    if ok:
-                        jpg = buffer.tobytes()
-                        stream_chunk = (
-                            b"--frame\r\n"
-                            b"Content-Type: image/jpeg\r\n\r\n" + jpg + b"\r\n"
+                if is_violation:
+                    fingerprint = _build_violation_fingerprint(job.source, worker_id, missing_items)
+                    now = time.time()
+                    last_time = job.last_violation_by_key.get(fingerprint, 0.0)
+                    if now - last_time >= VIOLATION_DEDUP_SECONDS:
+                        job.last_violation_by_key[fingerprint] = now
+                        write_violation(
+                            job=job,
+                            track_id=track_id,
+                            worker_id=worker_id,
+                            missing_items=missing_items,
+                            ppe_status=ppe_status,
+                            confidence=_violation_confidence(missing_items, ppe_confidence),
                         )
 
-        if should_sleep:
-            time.sleep(0.05)
-            continue
-        if stream_chunk is None:
-            continue
+            _cleanup_stale_state(job, frame_number, active_track_ids)
 
-        _apply_frame_rate_limit(frame_started_at)
-        yield stream_chunk
+            elapsed = max(time.perf_counter() - frame_started_at, 1e-6)
+            fps_value = round(1.0 / elapsed, 2)
+            if FPS_OVERLAY_ENABLED:
+                cv2.putText(
+                    frame,
+                    f"FPS: {fps_value}",
+                    (12, 28),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.7,
+                    (255, 230, 0),
+                    2,
+                )
+
+            ok, buffer = cv2.imencode(".jpg", frame)
+            if not ok:
+                continue
+
+            with job.condition:
+                job.people_detected = detected_people
+                job.active_tracks = active_tracks
+                job.violating_tracks = violating_tracks
+                job.fps = fps_value
+                job.latest_frame_time = datetime.datetime.now(datetime.UTC).isoformat()
+                job.latest_frame_jpeg = buffer.tobytes()
+                job.latest_frame_seq += 1
+                job.condition.notify_all()
+
+            _apply_frame_rate_limit(frame_started_at)
+    finally:
+        capture.release()
+
+
+def generate_frames(job_id: str):
+    job = _resolve_job(job_id)
+    if job is None:
+        return
+
+    last_seq = -1
+    while not SHUTDOWN_EVENT.is_set() and not job.stop_event.is_set():
+        with job.condition:
+            if job.latest_frame_jpeg is None or job.latest_frame_seq == last_seq:
+                job.condition.wait(timeout=0.5)
+            if job.latest_frame_jpeg is None:
+                continue
+            last_seq = job.latest_frame_seq
+            jpg = job.latest_frame_jpeg
+
+        yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + jpg + b"\r\n"
 
 
 @app.route("/")
@@ -1213,16 +1301,16 @@ def favicon():
 
 @app.route("/camera")
 def camera():
-    if not open_camera():
-        return render_template("camera.html", source="Camera Unavailable", source_path="N/A"), 503
-    return render_template("camera.html", source=_source_label(SOURCE), source_path=SOURCE_PATH)
+    job = _ensure_job("CAMERA")
+    _await_job_start(job)
+    return _render_job_camera(job)
 
 
 @app.route("/recorded")
 def recorded():
-    if not open_recorded_video():
-        return render_template("camera.html", source="Recorded Video Unavailable", source_path=str(RECORDED_VIDEO_PATH)), 503
-    return render_template("camera.html", source=_source_label(SOURCE), source_path=SOURCE_PATH)
+    job = _ensure_job("RECORDED_VIDEO", str(RECORDED_VIDEO_PATH))
+    _await_job_start(job)
+    return _render_job_camera(job)
 
 
 @app.route("/upload", methods=["GET", "POST"])
@@ -1242,34 +1330,91 @@ def upload_video():
     save_path = Path("videos") / f"uploaded_{int(time.time())}{suffix}"
     uploaded.save(save_path)
 
-    if not open_source("UPLOADED_VIDEO", str(save_path)):
-        return redirect(url_for("upload_video"))
+    job = _ensure_uploaded_job(str(save_path))
+    _await_job_start(job)
+    return _render_job_camera(job)
 
-    return render_template("camera.html", source="Uploaded Video", source_path=str(save_path))
+
+def _render_job_camera(job: SourceJob):
+    urls = _job_stream_urls(job)
+    with job.lock:
+        source = _source_label(job.source)
+        source_path = job.source_path
+        source_ready = job.source_ready
+    status_code = 200 if source_ready else 503
+    return render_template(
+        "camera.html",
+        source=source,
+        source_path=source_path,
+        feed_url=urls["feed_url"],
+        metrics_url=urls["metrics_url"],
+        dashboard_url=urls["dashboard_url"],
+        job_id=job.job_id,
+    ), status_code
+
+
+@app.route("/jobs/<job_id>")
+def view_job(job_id: str):
+    job = _resolve_job(job_id)
+    if job is None:
+        return redirect(url_for("dashboard"))
+    _set_active_job(job.job_id)
+    return _render_job_camera(job)
 
 
 @app.route("/video_feed")
 def video_feed():
-    if not ensure_default_source():
+    job = ensure_default_job()
+    if job is None:
         return Response(status=503)
-    return Response(generate_frames(), mimetype="multipart/x-mixed-replace; boundary=frame")
+    return Response(generate_frames(job.job_id), mimetype="multipart/x-mixed-replace; boundary=frame")
+
+
+@app.route("/video_feed/<job_id>")
+def video_feed_job(job_id: str):
+    job = _resolve_job(job_id)
+    if job is None:
+        return Response(status=404)
+    return Response(generate_frames(job.job_id), mimetype="multipart/x-mixed-replace; boundary=frame")
 
 
 @app.route("/dashboard")
 def dashboard():
-    return render_template("dashboard.html")
+    requested_job_id = request.args.get("job_id")
+    job = _resolve_job(requested_job_id)
+    if job is None:
+        job = ensure_default_job()
+    if job is None:
+        return render_template(
+            "dashboard.html",
+            job_id="",
+            feed_url=url_for("video_feed"),
+            metrics_url=url_for("api_metrics"),
+            logs_url=url_for("api_logs"),
+        )
+    urls = _job_stream_urls(job)
+    return render_template(
+        "dashboard.html",
+        job_id=job.job_id,
+        feed_url=urls["feed_url"],
+        metrics_url=urls["metrics_url"],
+        logs_url=urls["logs_url"],
+        camera_view_url=url_for("view_job", job_id=job.job_id),
+    )
 
 
 @app.route("/api/metrics")
 def api_metrics():
-    return jsonify(_snapshot_metrics())
+    job_id = request.args.get("job_id")
+    return jsonify(_snapshot_metrics(job_id))
 
 
 @app.route("/api/logs")
 def api_logs():
     limit = request.args.get("limit", default=80, type=int)
     limit = max(1, min(limit, 500))
-    return jsonify({"logs": get_recent_violations(limit=limit)})
+    job_id = request.args.get("job_id")
+    return jsonify({"logs": get_recent_violations(limit=limit, job_id=job_id)})
 
 
 @app.route("/api/datasets")
@@ -1284,7 +1429,6 @@ if __name__ == "__main__":
     signal.signal(signal.SIGTERM, _handle_shutdown)
 
     run_startup_validation(fail_on_error=REQUIRE_VALID_PPE_MODEL)
-    LIVE_METRICS["total_logged_violations"] = _count_existing_log_entries()
     get_dataset_summary(force=True)
-    ensure_default_source()
+    ensure_default_job()
     app.run(host=SERVER_HOST, port=SERVER_PORT, debug=False)
