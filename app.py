@@ -7,6 +7,7 @@ import logging
 import os
 import re
 import signal
+import sqlite3
 import threading
 import time
 from collections import deque
@@ -95,12 +96,14 @@ PPE_MODEL_PATH = Path(os.getenv("PPE_MODEL_PATH", "models/ppe.pt"))
 PPE_FALLBACK_MODEL_PATH = Path(os.getenv("PPE_FALLBACK_MODEL_PATH", "yolov8n.pt"))
 RECORDED_VIDEO_PATH = Path(os.getenv("RECORDED_VIDEO_PATH", "videos/test-video.mp4"))
 VIOLATIONS_LOG_PATH = Path(os.getenv("VIOLATIONS_LOG_PATH", "violations.log"))
+DATABASE_PATH = Path(os.getenv("DATABASE_PATH", "data/ppe_guardian.db"))
 APP_ENV = os.getenv("APP_ENV", os.getenv("FLASK_ENV", "development")).strip().lower()
 IS_PRODUCTION = APP_ENV == "production"
 REQUIRE_VALID_PPE_MODEL = _env_bool("REQUIRE_VALID_PPE_MODEL", False)
 AUTO_OPEN_SOURCE = os.getenv("AUTO_OPEN_SOURCE", "recorded").strip().lower()
 SERVER_HOST = os.getenv("SERVER_HOST", "127.0.0.1").strip()
 SERVER_PORT = _env_int("SERVER_PORT", 8000)
+UPLOAD_RETENTION_DAYS = max(1, _env_int("UPLOAD_RETENTION_DAYS", 7))
 
 PERSON_CONFIDENCE_THRESHOLD = _env_float("PERSON_CONFIDENCE_THRESHOLD", 0.45)
 PPE_CONFIDENCE_THRESHOLD = _env_float("PPE_CONFIDENCE_THRESHOLD", 0.35)
@@ -282,21 +285,118 @@ DATASET_CACHE = {"last_scan": 0.0, "summary": []}
 DATASET_LOCK = threading.Lock()
 DATASET_SCAN_INTERVAL_SECONDS = 60
 LOG_COUNT_LOCK = threading.Lock()
+DB_LOCK = threading.Lock()
 
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".m4v"}
 
 
+def _ensure_database_dir() -> None:
+    DATABASE_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+
+def _db_connection() -> sqlite3.Connection:
+    _ensure_database_dir()
+    conn = sqlite3.connect(DATABASE_PATH, timeout=30.0)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_database() -> None:
+    with DB_LOCK:
+        with _db_connection() as conn:
+            conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS violations (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    job_id TEXT,
+                    worker_id TEXT,
+                    violation_type TEXT NOT NULL,
+                    confidence REAL NOT NULL,
+                    timestamp TEXT NOT NULL,
+                    camera_source TEXT NOT NULL,
+                    source TEXT NOT NULL,
+                    source_path TEXT NOT NULL,
+                    track_id INTEGER NOT NULL,
+                    missing_json TEXT NOT NULL,
+                    status_json TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_violations_timestamp
+                    ON violations(timestamp DESC);
+                CREATE INDEX IF NOT EXISTS idx_violations_job_id
+                    ON violations(job_id, timestamp DESC);
+
+                CREATE TABLE IF NOT EXISTS uploads (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    job_id TEXT NOT NULL,
+                    original_filename TEXT NOT NULL,
+                    stored_path TEXT NOT NULL,
+                    uploaded_at TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    source_status TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_uploads_job_id
+                    ON uploads(job_id);
+                CREATE INDEX IF NOT EXISTS idx_uploads_expires_at
+                    ON uploads(expires_at);
+                """
+            )
+
+
 def _count_existing_log_entries() -> int:
-    log_path = VIOLATIONS_LOG_PATH
-    if not log_path.exists():
-        return 0
-    with log_path.open("r", encoding="utf-8", errors="ignore") as f:
-        return sum(1 for line in f if line.strip())
+    with DB_LOCK:
+        with _db_connection() as conn:
+            row = conn.execute("SELECT COUNT(*) AS count FROM violations").fetchone()
+    return int(row["count"]) if row is not None else 0
 
 
-GLOBAL_LOG_COUNT = _count_existing_log_entries()
+GLOBAL_LOG_COUNT = 0
+
+
+def _record_upload(job_id: str, original_filename: str, stored_path: str) -> None:
+    uploaded_at = datetime.datetime.now(datetime.UTC)
+    expires_at = uploaded_at + datetime.timedelta(days=UPLOAD_RETENTION_DAYS)
+    with DB_LOCK:
+        with _db_connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO uploads (job_id, original_filename, stored_path, uploaded_at, expires_at, source_status)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    job_id,
+                    original_filename,
+                    stored_path,
+                    uploaded_at.isoformat(),
+                    expires_at.isoformat(),
+                    "uploaded",
+                ),
+            )
+
+
+def _update_upload_status(job_id: str, source_status: str) -> None:
+    with DB_LOCK:
+        with _db_connection() as conn:
+            conn.execute(
+                "UPDATE uploads SET source_status = ? WHERE job_id = ?",
+                (source_status, job_id),
+            )
+
+
+def _database_health_snapshot() -> dict[str, Any]:
+    with DB_LOCK:
+        with _db_connection() as conn:
+            violation_count = conn.execute("SELECT COUNT(*) AS count FROM violations").fetchone()["count"]
+            upload_count = conn.execute("SELECT COUNT(*) AS count FROM uploads").fetchone()["count"]
+    return {
+        "path": str(DATABASE_PATH),
+        "ok": True,
+        "violations": int(violation_count),
+        "uploads": int(upload_count),
+    }
 
 
 def _job_base_metrics(job: SourceJob) -> dict[str, Any]:
@@ -355,6 +455,28 @@ def _snapshot_metrics(job_id: Optional[str] = None) -> dict[str, Any]:
         return dict(_job_base_metrics(job))
 
 
+def _active_jobs_snapshot() -> list[dict[str, Any]]:
+    with JOBS_LOCK:
+        jobs = list(JOBS.values())
+    snapshot: list[dict[str, Any]] = []
+    for job in jobs:
+        with job.lock:
+            snapshot.append(
+                {
+                    "job_id": job.job_id,
+                    "source": job.source,
+                    "source_path": job.source_path,
+                    "source_ready": job.source_ready,
+                    "source_error": job.source_error,
+                    "last_frame_time": job.latest_frame_time,
+                    "fps": job.fps,
+                    "active_tracks": job.active_tracks,
+                    "thread_alive": bool(job.thread and job.thread.is_alive()),
+                }
+            )
+    return snapshot
+
+
 def run_startup_validation(fail_on_error: bool = False) -> dict[str, Any]:
     global MODEL_INTEGRITY_STATUS, PPE_CLASS_MAP, PPE_CLASS_ITEM_MAP, PPE_DETECTION_ENABLED
 
@@ -388,6 +510,8 @@ def run_startup_validation(fail_on_error: bool = False) -> dict[str, Any]:
     return MODEL_INTEGRITY_STATUS
 
 
+init_database()
+GLOBAL_LOG_COUNT = _count_existing_log_entries()
 run_startup_validation(fail_on_error=False)
 if not MODEL_INTEGRITY_STATUS["ok"]:
     actual = ", ".join(MODEL_INTEGRITY_STATUS.get("actual_classes", [])) or "none"
@@ -690,6 +814,12 @@ def _ensure_uploaded_job(path: str) -> SourceJob:
     job.thread = thread
     thread.start()
     _set_active_job(job.job_id)
+    return job
+
+
+def _ensure_uploaded_job_with_metadata(path: str, original_filename: str) -> SourceJob:
+    job = _ensure_uploaded_job(path)
+    _record_upload(job.job_id, original_filename, path)
     return job
 
 
@@ -1024,8 +1154,38 @@ def write_violation(
         "status": ppe_status,
     }
 
-    with VIOLATIONS_LOG_PATH.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(payload, separators=(",", ":")) + "\n")
+    with DB_LOCK:
+        with _db_connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO violations (
+                    job_id,
+                    worker_id,
+                    violation_type,
+                    confidence,
+                    timestamp,
+                    camera_source,
+                    source,
+                    source_path,
+                    track_id,
+                    missing_json,
+                    status_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    payload["job_id"],
+                    payload["worker_id"],
+                    payload["violation_type"],
+                    payload["confidence"],
+                    payload["timestamp"],
+                    payload["camera_source"],
+                    payload["source"],
+                    payload["source_path"],
+                    payload["id"],
+                    json.dumps(payload["missing"], separators=(",", ":")),
+                    json.dumps(payload["status"], separators=(",", ":")),
+                ),
+            )
 
     _log_structured(logging.INFO, "violation_logged", payload)
 
@@ -1036,77 +1196,49 @@ def write_violation(
         job.last_violation = payload
 
 
-def parse_violation_line(line: str) -> Optional[dict[str, Any]]:
-    raw = line.strip()
-    if not raw:
-        return None
-
+def _violation_from_row(row: sqlite3.Row) -> dict[str, Any]:
     try:
-        parsed = json.loads(raw)
-        status = parsed.get("status") if isinstance(parsed.get("status"), dict) else {}
-        missing = parsed.get("missing")
-        if not isinstance(missing, list):
-            missing = [k for k, v in status.items() if not v]
-
-        return {
-            "job_id": parsed.get("job_id"),
-            "worker_id": parsed.get("worker_id"),
-            "violation_type": parsed.get("violation_type"),
-            "confidence": parsed.get("confidence", 0.0),
-            "timestamp": parsed.get("timestamp"),
-            "source": parsed.get("source", "UNKNOWN"),
-            "camera_source": parsed.get("camera_source", parsed.get("source", "UNKNOWN")),
-            "source_path": parsed.get("source_path", ""),
-            "id": parsed.get("id"),
-            "missing": missing,
-            "status": status,
-        }
+        missing = json.loads(row["missing_json"]) if row["missing_json"] else []
     except json.JSONDecodeError:
-        pass
+        missing = []
 
-    legacy = re.match(r"^(.*?)\s*\|\s*SOURCE=(.*?)\s*\|\s*ID=(\d+)\s*\|\s*(\{.*\})$", raw)
-    if not legacy:
-        return None
-
-    timestamp, source, pid, status_blob = legacy.groups()
     try:
-        status = ast.literal_eval(status_blob)
-    except (ValueError, SyntaxError):
+        status = json.loads(row["status_json"]) if row["status_json"] else {}
+    except json.JSONDecodeError:
         status = {}
 
     return {
-        "job_id": None,
-        "worker_id": None,
-        "violation_type": ",".join(sorted(f"missing_{item}" for item, ok in status.items() if not ok)),
-        "confidence": 0.0,
-        "timestamp": timestamp,
-        "source": source,
-        "camera_source": source,
-        "source_path": "",
-        "id": int(pid),
-        "missing": [k for k, v in status.items() if not v],
+        "job_id": row["job_id"],
+        "worker_id": row["worker_id"],
+        "violation_type": row["violation_type"],
+        "confidence": row["confidence"],
+        "timestamp": row["timestamp"],
+        "source": row["source"],
+        "camera_source": row["camera_source"],
+        "source_path": row["source_path"],
+        "id": row["track_id"],
+        "missing": missing,
         "status": status,
     }
 
 
 def get_recent_violations(limit: int = 100, job_id: Optional[str] = None) -> list[dict[str, Any]]:
-    log_path = VIOLATIONS_LOG_PATH
-    if not log_path.exists():
-        return []
+    query = """
+        SELECT job_id, worker_id, violation_type, confidence, timestamp, camera_source, source, source_path,
+               track_id, missing_json, status_json
+        FROM violations
+    """
+    params: list[Any] = []
+    if job_id is not None:
+        query += " WHERE job_id = ?"
+        params.append(job_id)
+    query += " ORDER BY timestamp DESC LIMIT ?"
+    params.append(limit)
 
-    try:
-        lines = log_path.read_text(encoding="utf-8", errors="ignore").splitlines()
-    except OSError:
-        return []
-
-    parsed: list[dict[str, Any]] = []
-    for line in reversed(lines):
-        item = parse_violation_line(line)
-        if item is not None and (job_id is None or item.get("job_id") == job_id):
-            parsed.append(item)
-        if len(parsed) >= limit:
-            break
-    return parsed
+    with DB_LOCK:
+        with _db_connection() as conn:
+            rows = conn.execute(query, params).fetchall()
+    return [_violation_from_row(row) for row in rows]
 
 
 def _job_worker(job: SourceJob) -> None:
@@ -1117,6 +1249,9 @@ def _job_worker(job: SourceJob) -> None:
         job.source_ready = capture is not None and open_error is None
         job.source_error = open_error
         job.condition.notify_all()
+
+    if job.requested_source == "UPLOADED_VIDEO":
+        _update_upload_status(job.job_id, "ready" if capture is not None and open_error is None else (open_error or "source_open_failed"))
 
     if capture is None:
         return
@@ -1330,7 +1465,7 @@ def upload_video():
     save_path = Path("videos") / f"uploaded_{int(time.time())}{suffix}"
     uploaded.save(save_path)
 
-    job = _ensure_uploaded_job(str(save_path))
+    job = _ensure_uploaded_job_with_metadata(str(save_path), uploaded.filename)
     _await_job_start(job)
     return _render_job_camera(job)
 
@@ -1415,6 +1550,29 @@ def api_logs():
     limit = max(1, min(limit, 500))
     job_id = request.args.get("job_id")
     return jsonify({"logs": get_recent_violations(limit=limit, job_id=job_id)})
+
+
+@app.route("/api/health")
+def api_health():
+    active_job = _resolve_job(request.args.get("job_id"))
+    metrics = _snapshot_metrics(active_job.job_id if active_job is not None else None)
+    db_health = _database_health_snapshot()
+    return jsonify(
+        {
+            "status": "ok" if db_health["ok"] else "degraded",
+            "database": db_health,
+            "model": {
+                "integrity_ok": MODEL_INTEGRITY_STATUS["ok"],
+                "model_path": MODEL_INTEGRITY_STATUS.get("model_path", PPE_MODEL_USED_PATH or str(PPE_MODEL_PATH)),
+                "model_source": MODEL_INTEGRITY_STATUS.get("model_source", PPE_MODEL_SOURCE),
+                "missing_classes": MODEL_INTEGRITY_STATUS.get("missing_classes", []),
+                "actual_classes": MODEL_INTEGRITY_STATUS.get("actual_classes", []),
+            },
+            "active_job": metrics,
+            "jobs": _active_jobs_snapshot(),
+            "timestamp": datetime.datetime.now(datetime.UTC).isoformat(),
+        }
+    )
 
 
 @app.route("/api/datasets")

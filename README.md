@@ -43,3 +43,12 @@ cp .env.example .env.local
 
 Use `.env.local` for machine-specific settings such as `SERVER_PORT`,
 `AUTO_OPEN_SOURCE`, or `REQUIRE_VALID_PPE_MODEL`. The file is ignored by git.
+
+## Persistence
+The app now stores violations and upload metadata in SQLite at `data/ppe_guardian.db`
+by default. You can override the location with `DATABASE_PATH` in `.env.local`.
+
+Health and observability:
+```bash
+curl http://127.0.0.1:8000/api/health
+```
