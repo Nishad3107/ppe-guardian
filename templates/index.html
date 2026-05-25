@@ -15,6 +15,13 @@
       <a href="/recorded">Recorded Video</a>
       <a href="/upload">Upload Video</a>
       <a href="/dashboard">Dashboard</a>
+      {% if session.get('authenticated') %}
+        <form method="POST" action="{{ url_for('logout') }}" class="nav-form">
+          <button class="btn btn-secondary btn-small" type="submit">Logout</button>
+        </form>
+      {% else %}
+        <a href="{{ url_for('login') }}">Login</a>
+      {% endif %}
     </nav>
   </header>
 
@@ -29,6 +36,9 @@
       <div class="hero-actions">
         <a class="btn btn-primary" href="/camera">Start Live Camera</a>
         <a class="btn btn-secondary" href="/dashboard">Open Dashboard</a>
+        {% if not session.get('authenticated') %}
+          <a class="btn btn-secondary" href="{{ url_for('login') }}">Admin Login</a>
+        {% endif %}
       </div>
     </section>
 

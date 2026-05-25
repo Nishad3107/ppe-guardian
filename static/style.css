@@ -49,6 +49,7 @@ body {
   display: flex;
   flex-wrap: wrap;
   gap: 14px;
+  align-items: center;
 }
 
 .nav-links a {
@@ -60,6 +61,10 @@ body {
 
 .nav-links a:hover {
   color: var(--brand-strong);
+}
+
+.nav-form {
+  margin: 0;
 }
 
 .page {
@@ -117,6 +122,11 @@ body {
   align-items: center;
   justify-content: center;
   font-size: 14px;
+}
+
+.btn-small {
+  padding: 8px 12px;
+  font-size: 13px;
 }
 
 .btn-primary {
@@ -275,8 +285,17 @@ thead th {
   justify-content: center;
 }
 
+.page-auth {
+  display: flex;
+  justify-content: center;
+}
+
 .upload-panel {
   width: min(620px, 94vw);
+}
+
+.auth-panel {
+  width: min(460px, 94vw);
 }
 
 .upload-form {
@@ -286,11 +305,58 @@ thead th {
   gap: 14px;
 }
 
+.auth-form {
+  margin-top: 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.auth-form label {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  font-weight: 600;
+}
+
+.auth-form input {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--surface-2);
+  padding: 12px;
+}
+
 .upload-form input[type="file"] {
   border: 1px solid var(--line);
   border-radius: 10px;
   background: var(--surface-2);
   padding: 10px;
+}
+
+.flash-stack {
+  margin-top: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.flash {
+  border-radius: 12px;
+  padding: 12px 14px;
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.flash-error {
+  background: #fef2f2;
+  border: 1px solid #fecaca;
+  color: #991b1b;
+}
+
+.flash-success {
+  background: #ecfdf5;
+  border: 1px solid #bbf7d0;
+  color: #166534;
 }
 
 @media (max-width: 960px) {

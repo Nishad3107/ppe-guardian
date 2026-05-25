@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Upload Video</title>
+  <title>Login | PPE Guardian</title>
   <link rel="icon" type="image/svg+xml" href="{{ url_for('static', filename='favicon.svg') }}">
   <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
 </head>
@@ -14,18 +14,14 @@
       <a href="/">Home</a>
       <a href="/camera">Live Camera</a>
       <a href="/recorded">Recorded Video</a>
-      <a href="/upload">Upload Video</a>
-      <a href="/dashboard">Dashboard</a>
-      <form method="POST" action="{{ url_for('logout') }}" class="nav-form">
-        <button class="btn btn-secondary btn-small" type="submit">Logout</button>
-      </form>
     </nav>
   </header>
 
-  <main class="page page-upload">
-    <section class="panel upload-panel">
-      <h2>Upload a Video for PPE Monitoring</h2>
-      <p class="muted">Supported formats: mp4, mov, avi, mkv, m4v. Max size: {{ config['MAX_CONTENT_LENGTH'] // (1024 * 1024) }} MB.</p>
+  <main class="page page-auth">
+    <section class="panel auth-panel">
+      <h2>Secure Access</h2>
+      <p class="muted">Sign in to access uploads, dashboards, logs, and health operations.</p>
+
       {% with messages = get_flashed_messages(with_categories=true) %}
         {% if messages %}
           <div class="flash-stack">
@@ -35,9 +31,18 @@
           </div>
         {% endif %}
       {% endwith %}
-      <form method="POST" enctype="multipart/form-data" class="upload-form">
-        <input type="file" name="video" accept="video/*" required>
-        <button class="btn btn-primary" type="submit">Start Detection</button>
+
+      <form method="POST" class="auth-form">
+        <input type="hidden" name="next" value="{{ next }}">
+        <label>
+          <span>Username</span>
+          <input type="text" name="username" autocomplete="username" required>
+        </label>
+        <label>
+          <span>Password</span>
+          <input type="password" name="password" autocomplete="current-password" required>
+        </label>
+        <button class="btn btn-primary" type="submit">Login</button>
       </form>
     </section>
   </main>

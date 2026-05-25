@@ -16,6 +16,9 @@
       <a href="/recorded">Recorded Video</a>
       <a href="/upload">Upload Video</a>
       <a href="/dashboard">Dashboard</a>
+      <form method="POST" action="{{ url_for('logout') }}" class="nav-form">
+        <button class="btn btn-secondary btn-small" type="submit">Logout</button>
+      </form>
     </nav>
   </header>
 

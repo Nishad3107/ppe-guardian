@@ -12,6 +12,7 @@ import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field
+from functools import wraps
 from pathlib import Path
 from typing import Any, Optional
 from uuid import uuid4
@@ -19,8 +20,21 @@ from uuid import uuid4
 import cv2
 import numpy as np
 from deep_sort_realtime.deepsort_tracker import DeepSort
-from flask import Flask, Response, jsonify, redirect, render_template, request, send_from_directory, url_for
+from flask import (
+    Flask,
+    Response,
+    flash,
+    jsonify,
+    redirect,
+    render_template,
+    request,
+    send_from_directory,
+    session,
+    url_for,
+)
 from ultralytics import YOLO
+from werkzeug.exceptions import RequestEntityTooLarge
+from werkzeug.utils import secure_filename
 
 app = Flask(__name__)
 
@@ -44,6 +58,43 @@ def _load_local_env_file(path: Path) -> None:
         if not key:
             continue
         os.environ.setdefault(key, value.strip().strip("\"'"))
+
+
+def _auth_enabled() -> bool:
+    return AUTH_REQUIRED
+
+
+def _is_authenticated() -> bool:
+    return bool(session.get("authenticated"))
+
+
+def _login_user() -> None:
+    session["authenticated"] = True
+    session["auth_username"] = AUTH_USERNAME
+
+
+def _logout_user() -> None:
+    session.pop("authenticated", None)
+    session.pop("auth_username", None)
+
+
+def _safe_next_url(value: Optional[str]) -> str:
+    if not value or not value.startswith("/"):
+        return url_for("dashboard")
+    if value.startswith("//"):
+        return url_for("dashboard")
+    return value
+
+
+def login_required(view):
+    @wraps(view)
+    def wrapped(*args, **kwargs):
+        if not _auth_enabled() or _is_authenticated():
+            return view(*args, **kwargs)
+        target = request.full_path if request.query_string else request.path
+        return redirect(url_for("login", next=target))
+
+    return wrapped
 
 PPE_ITEMS = ("helmet", "mask", "glasses", "boots")
 EXPECTED_PPE_CLASSES = (
@@ -104,6 +155,11 @@ AUTO_OPEN_SOURCE = os.getenv("AUTO_OPEN_SOURCE", "recorded").strip().lower()
 SERVER_HOST = os.getenv("SERVER_HOST", "127.0.0.1").strip()
 SERVER_PORT = _env_int("SERVER_PORT", 8000)
 UPLOAD_RETENTION_DAYS = max(1, _env_int("UPLOAD_RETENTION_DAYS", 7))
+MAX_UPLOAD_SIZE_MB = max(1, _env_int("MAX_UPLOAD_SIZE_MB", 200))
+AUTH_USERNAME = os.getenv("AUTH_USERNAME", "admin").strip() or "admin"
+AUTH_PASSWORD = os.getenv("AUTH_PASSWORD", "admin123").strip() or "admin123"
+AUTH_REQUIRED = _env_bool("AUTH_REQUIRED", True)
+SECRET_KEY = os.getenv("SECRET_KEY", "ppe-guardian-dev-secret")
 
 PERSON_CONFIDENCE_THRESHOLD = _env_float("PERSON_CONFIDENCE_THRESHOLD", 0.45)
 PPE_CONFIDENCE_THRESHOLD = _env_float("PPE_CONFIDENCE_THRESHOLD", 0.35)
@@ -125,6 +181,8 @@ MAX_INFERENCE_TIME_SECONDS = _env_float("MAX_INFERENCE_TIME_SECONDS", 0.08)
 PERF_WARNING_COOLDOWN_SECONDS = _env_float("PERF_WARNING_COOLDOWN_SECONDS", 3.0)
 
 PERSON_MODEL = YOLO(str(PERSON_MODEL_PATH))
+app.config["SECRET_KEY"] = SECRET_KEY
+app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD_SIZE_MB * 1024 * 1024
 
 
 def _ensure_models_dir() -> None:
@@ -286,10 +344,13 @@ DATASET_LOCK = threading.Lock()
 DATASET_SCAN_INTERVAL_SECONDS = 60
 LOG_COUNT_LOCK = threading.Lock()
 DB_LOCK = threading.Lock()
+CLEANUP_LOCK = threading.Lock()
+CLEANUP_LAST_RUN = 0.0
 
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".m4v"}
+VIDEO_MIME_PREFIXES = ("video/",)
 
 
 def _ensure_database_dir() -> None:
@@ -335,7 +396,8 @@ def init_database() -> None:
                     stored_path TEXT NOT NULL,
                     uploaded_at TEXT NOT NULL,
                     expires_at TEXT NOT NULL,
-                    source_status TEXT NOT NULL
+                    source_status TEXT NOT NULL,
+                    cleaned_at TEXT
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_uploads_job_id
@@ -344,6 +406,9 @@ def init_database() -> None:
                     ON uploads(expires_at);
                 """
             )
+            columns = {row["name"] for row in conn.execute("PRAGMA table_info(uploads)").fetchall()}
+            if "cleaned_at" not in columns:
+                conn.execute("ALTER TABLE uploads ADD COLUMN cleaned_at TEXT")
 
 
 def _count_existing_log_entries() -> int:
@@ -397,6 +462,48 @@ def _database_health_snapshot() -> dict[str, Any]:
         "violations": int(violation_count),
         "uploads": int(upload_count),
     }
+
+
+def cleanup_expired_uploads(force: bool = False) -> int:
+    global CLEANUP_LAST_RUN
+    now = time.time()
+    if not force and (now - CLEANUP_LAST_RUN) < 300:
+        return 0
+
+    cleaned = 0
+    with CLEANUP_LOCK:
+        now = time.time()
+        if not force and (now - CLEANUP_LAST_RUN) < 300:
+            return 0
+        cutoff = datetime.datetime.now(datetime.UTC).isoformat()
+        with DB_LOCK:
+            with _db_connection() as conn:
+                rows = conn.execute(
+                    """
+                    SELECT id, stored_path FROM uploads
+                    WHERE cleaned_at IS NULL AND expires_at <= ?
+                    """,
+                    (cutoff,),
+                ).fetchall()
+                for row in rows:
+                    stored_path = Path(row["stored_path"])
+                    if stored_path.exists():
+                        try:
+                            stored_path.unlink()
+                        except OSError as exc:
+                            LOGGER.warning("Failed to delete expired upload %s: %s", stored_path, exc)
+                            continue
+                    conn.execute(
+                        """
+                        UPDATE uploads
+                        SET source_status = ?, cleaned_at = ?
+                        WHERE id = ?
+                        """,
+                        ("expired_deleted", datetime.datetime.now(datetime.UTC).isoformat(), row["id"]),
+                    )
+                    cleaned += 1
+        CLEANUP_LAST_RUN = time.time()
+    return cleaned
 
 
 def _job_base_metrics(job: SourceJob) -> dict[str, Any]:
@@ -477,6 +584,17 @@ def _active_jobs_snapshot() -> list[dict[str, Any]]:
     return snapshot
 
 
+def _is_allowed_video_upload(uploaded) -> bool:
+    suffix = Path(uploaded.filename or "").suffix.lower()
+    if suffix not in VIDEO_EXTENSIONS:
+        return False
+    mimetype = (uploaded.mimetype or uploaded.content_type or "").lower()
+    if mimetype and any(mimetype.startswith(prefix) for prefix in VIDEO_MIME_PREFIXES):
+        return True
+    # Some browsers omit a useful mime type, so allow known video extensions.
+    return bool(suffix)
+
+
 def run_startup_validation(fail_on_error: bool = False) -> dict[str, Any]:
     global MODEL_INTEGRITY_STATUS, PPE_CLASS_MAP, PPE_CLASS_ITEM_MAP, PPE_DETECTION_ENABLED
 
@@ -512,7 +630,10 @@ def run_startup_validation(fail_on_error: bool = False) -> dict[str, Any]:
 
 init_database()
 GLOBAL_LOG_COUNT = _count_existing_log_entries()
+cleanup_expired_uploads(force=True)
 run_startup_validation(fail_on_error=False)
+if _auth_enabled() and AUTH_USERNAME == "admin" and AUTH_PASSWORD == "admin123":
+    LOGGER.warning("Using default dashboard/upload credentials. Override AUTH_USERNAME and AUTH_PASSWORD in .env.local.")
 if not MODEL_INTEGRITY_STATUS["ok"]:
     actual = ", ".join(MODEL_INTEGRITY_STATUS.get("actual_classes", [])) or "none"
     expected = ", ".join(MODEL_INTEGRITY_STATUS.get("expected_classes", []))
@@ -1429,6 +1550,31 @@ def index():
     return render_template("index.html")
 
 
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    if not _auth_enabled():
+        return redirect(url_for("index"))
+    if _is_authenticated():
+        return redirect(_safe_next_url(request.args.get("next")))
+
+    if request.method == "POST":
+        username = (request.form.get("username") or "").strip()
+        password = request.form.get("password") or ""
+        target = _safe_next_url(request.form.get("next"))
+        if username == AUTH_USERNAME and password == AUTH_PASSWORD:
+            _login_user()
+            return redirect(target)
+        flash("Invalid username or password.", "error")
+
+    return render_template("login.html", next=_safe_next_url(request.args.get("next")))
+
+
+@app.route("/logout", methods=["POST"])
+def logout():
+    _logout_user()
+    return redirect(url_for("login"))
+
+
 @app.route("/favicon.ico")
 def favicon():
     return send_from_directory(app.static_folder, "favicon.svg", mimetype="image/svg+xml")
@@ -1449,23 +1595,29 @@ def recorded():
 
 
 @app.route("/upload", methods=["GET", "POST"])
+@login_required
 def upload_video():
+    cleanup_expired_uploads()
+
     if request.method == "GET":
         return render_template("upload.html")
 
     uploaded = request.files.get("video")
     if not uploaded or uploaded.filename is None:
+        flash("Choose a video file to upload.", "error")
         return redirect(url_for("upload_video"))
 
-    suffix = Path(uploaded.filename).suffix.lower()
-    if suffix not in VIDEO_EXTENSIONS:
+    if not _is_allowed_video_upload(uploaded):
+        flash("Only supported video files are allowed.", "error")
         return redirect(url_for("upload_video"))
 
     Path("videos").mkdir(exist_ok=True)
+    safe_name = secure_filename(uploaded.filename) or "upload.mp4"
+    suffix = Path(safe_name).suffix.lower()
     save_path = Path("videos") / f"uploaded_{int(time.time())}{suffix}"
     uploaded.save(save_path)
 
-    job = _ensure_uploaded_job_with_metadata(str(save_path), uploaded.filename)
+    job = _ensure_uploaded_job_with_metadata(str(save_path), safe_name)
     _await_job_start(job)
     return _render_job_camera(job)
 
@@ -1489,6 +1641,7 @@ def _render_job_camera(job: SourceJob):
 
 
 @app.route("/jobs/<job_id>")
+@login_required
 def view_job(job_id: str):
     job = _resolve_job(job_id)
     if job is None:
@@ -1514,6 +1667,7 @@ def video_feed_job(job_id: str):
 
 
 @app.route("/dashboard")
+@login_required
 def dashboard():
     requested_job_id = request.args.get("job_id")
     job = _resolve_job(requested_job_id)
@@ -1545,6 +1699,7 @@ def api_metrics():
 
 
 @app.route("/api/logs")
+@login_required
 def api_logs():
     limit = request.args.get("limit", default=80, type=int)
     limit = max(1, min(limit, 500))
@@ -1553,7 +1708,9 @@ def api_logs():
 
 
 @app.route("/api/health")
+@login_required
 def api_health():
+    cleaned_uploads = cleanup_expired_uploads()
     active_job = _resolve_job(request.args.get("job_id"))
     metrics = _snapshot_metrics(active_job.job_id if active_job is not None else None)
     db_health = _database_health_snapshot()
@@ -1570,15 +1727,30 @@ def api_health():
             },
             "active_job": metrics,
             "jobs": _active_jobs_snapshot(),
+            "security": {
+                "auth_required": _auth_enabled(),
+                "max_upload_size_mb": MAX_UPLOAD_SIZE_MB,
+            },
+            "operations": {
+                "cleanup_run_removed_uploads": cleaned_uploads,
+                "upload_retention_days": UPLOAD_RETENTION_DAYS,
+            },
             "timestamp": datetime.datetime.now(datetime.UTC).isoformat(),
         }
     )
 
 
 @app.route("/api/datasets")
+@login_required
 def api_datasets():
     force = request.args.get("refresh", "0") == "1"
     return jsonify({"datasets": get_dataset_summary(force=force)})
+
+
+@app.errorhandler(RequestEntityTooLarge)
+def handle_request_entity_too_large(_error):
+    flash(f"Upload rejected. Maximum file size is {MAX_UPLOAD_SIZE_MB} MB.", "error")
+    return redirect(url_for("upload_video"))
 
 
 if __name__ == "__main__":

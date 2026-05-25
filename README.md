@@ -52,3 +52,23 @@ Health and observability:
 ```bash
 curl http://127.0.0.1:8000/api/health
 ```
+
+## Security Controls
+- Uploads are limited by `MAX_UPLOAD_SIZE_MB`
+- Unsupported upload mime types and extensions are rejected
+- Expired uploaded videos are cleaned up automatically using `UPLOAD_RETENTION_DAYS`
+- `/upload`, `/dashboard`, `/jobs/*`, `/api/logs`, `/api/datasets`, and `/api/health` require login
+
+Default local credentials:
+```bash
+username: admin
+password: admin123
+```
+
+Override them in `.env.local` before using this outside local development.
+
+## Production WSGI
+Use a production WSGI server instead of `python app.py`:
+```bash
+gunicorn --bind 0.0.0.0:8000 wsgi:application
+```
