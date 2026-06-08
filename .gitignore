@@ -28,4 +28,5 @@ datasets/
 
 # Temporary
 *.tmp
+.cache/
 videos/uploaded_*.mp4

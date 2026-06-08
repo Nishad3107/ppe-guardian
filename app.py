@@ -168,6 +168,8 @@ PPE_CONTAINMENT_THRESHOLD = _env_float("PPE_CONTAINMENT_THRESHOLD", 0.60)
 PPE_ASSOCIATION_MARGIN = _env_float("PPE_ASSOCIATION_MARGIN", 0.05)
 TARGET_MAX_FPS = _env_float("TARGET_MAX_FPS", 15.0)
 FPS_OVERLAY_ENABLED = _env_bool("FPS_OVERLAY_ENABLED", False)
+UPPER_BODY_RATIO = min(max(_env_float("UPPER_BODY_RATIO", 0.58), 0.2), 1.0)
+PPE_CROP_MARGIN_RATIO = max(_env_float("PPE_CROP_MARGIN_RATIO", 0.08), 0.0)
 
 PPE_REFRESH_FRAMES = max(1, int(_env_float("PPE_REFRESH_FRAMES", 1)))
 TEMPORAL_WINDOW_SIZE = max(1, _env_int("TEMPORAL_WINDOW_SIZE", 6))
@@ -327,6 +329,11 @@ class SourceJob:
     total_logged_violations: int = 0
     last_violation: Optional[dict[str, Any]] = None
     fps: float = 0.0
+    average_person_inference_ms: float = 0.0
+    average_ppe_inference_ms: float = 0.0
+    last_person_inference_ms: float = 0.0
+    last_ppe_inference_ms: float = 0.0
+    runtime_samples: int = 0
     tracker: DeepSort = field(default_factory=lambda: DeepSort(max_age=30, embedder=None))
     track_cache: dict[int, dict[str, Any]] = field(default_factory=dict)
     last_violation_by_key: dict[str, float] = field(default_factory=dict)
@@ -518,6 +525,11 @@ def _job_base_metrics(job: SourceJob) -> dict[str, Any]:
         "total_logged_violations": GLOBAL_LOG_COUNT,
         "last_violation": job.last_violation,
         "fps": job.fps,
+        "average_person_inference_ms": job.average_person_inference_ms,
+        "average_ppe_inference_ms": job.average_ppe_inference_ms,
+        "last_person_inference_ms": job.last_person_inference_ms,
+        "last_ppe_inference_ms": job.last_ppe_inference_ms,
+        "runtime_samples": job.runtime_samples,
         "ppe_supported_items": _supported_ppe_items(PPE_CLASS_MAP) if PPE_DETECTION_ENABLED else [],
         "ppe_model_path": MODEL_INTEGRITY_STATUS.get("model_path", PPE_MODEL_USED_PATH or str(PPE_MODEL_PATH)),
         "ppe_model_source": MODEL_INTEGRITY_STATUS.get("model_source", PPE_MODEL_SOURCE),
@@ -542,6 +554,11 @@ def _empty_metrics(job_id: Optional[str] = None) -> dict[str, Any]:
         "total_logged_violations": 0,
         "last_violation": None,
         "fps": 0.0,
+        "average_person_inference_ms": 0.0,
+        "average_ppe_inference_ms": 0.0,
+        "last_person_inference_ms": 0.0,
+        "last_ppe_inference_ms": 0.0,
+        "runtime_samples": 0,
         "ppe_supported_items": _supported_ppe_items(PPE_CLASS_MAP) if PPE_DETECTION_ENABLED else [],
         "ppe_model_path": MODEL_INTEGRITY_STATUS.get("model_path", PPE_MODEL_USED_PATH or str(PPE_MODEL_PATH)),
         "ppe_model_source": MODEL_INTEGRITY_STATUS.get("model_source", PPE_MODEL_SOURCE),
@@ -664,6 +681,32 @@ def _safe_crop(frame, x1: int, y1: int, x2: int, y2: int):
     if x2 <= x1 or y2 <= y1:
         return None
     return frame[y1:y2, x1:x2]
+
+
+def _clamp_box(box: tuple[int, int, int, int], frame_shape: tuple[int, ...]) -> tuple[int, int, int, int]:
+    h, w = frame_shape[:2]
+    x1, y1, x2, y2 = box
+    x1 = max(0, min(int(x1), w - 1))
+    y1 = max(0, min(int(y1), h - 1))
+    x2 = max(1, min(int(x2), w))
+    y2 = max(1, min(int(y2), h))
+    return x1, y1, x2, y2
+
+
+def _upper_body_box(person_box: tuple[int, int, int, int], frame_shape: tuple[int, ...]) -> tuple[int, int, int, int]:
+    x1, y1, x2, y2 = person_box
+    width = max(x2 - x1, 1)
+    height = max(y2 - y1, 1)
+    x_margin = int(width * PPE_CROP_MARGIN_RATIO)
+    y_margin = int(height * PPE_CROP_MARGIN_RATIO)
+    upper_y2 = y1 + int(height * UPPER_BODY_RATIO)
+    crop_box = (
+        x1 - x_margin,
+        y1 - y_margin,
+        x2 + x_margin,
+        upper_y2 + y_margin,
+    )
+    return _clamp_box(crop_box, frame_shape)
 
 
 def _simple_embed(crop) -> np.ndarray:
@@ -1014,13 +1057,13 @@ def _monitor_inference_time(stage: str, duration_seconds: float, source: str) ->
     )
 
 
-def _run_person_detection(frame) -> list[tuple[int, int, int, int]]:
+def _run_person_detection(frame) -> tuple[list[tuple[int, int, int, int]], float]:
     person_boxes: list[tuple[int, int, int, int]] = []
     started = time.perf_counter()
     try:
         result = PERSON_MODEL(frame, conf=PERSON_CONFIDENCE_THRESHOLD, verbose=False)[0]
     except Exception:
-        return person_boxes
+        return person_boxes, (time.perf_counter() - started) * 1000.0
     finally:
         _monitor_inference_time("person_detection", time.perf_counter() - started, "PERSON_MODEL")
 
@@ -1034,31 +1077,45 @@ def _run_person_detection(frame) -> list[tuple[int, int, int, int]]:
             continue
         x1, y1, x2, y2 = map(int, box.xyxy[0])
         person_boxes.append((x1, y1, x2, y2))
-    return person_boxes
+    return person_boxes, (time.perf_counter() - started) * 1000.0
 
 
-def _run_ppe_detection(frame) -> Optional[list[tuple[int, tuple[int, int, int, int], float]]]:
+def _run_ppe_detection(frame, person_boxes: list[tuple[int, int, int, int]]) -> tuple[Optional[list[tuple[int, tuple[int, int, int, int], float]]], float]:
     if not PPE_DETECTION_ENABLED or PPE_MODEL is None:
-        return None
+        return None, 0.0
+
+    if not person_boxes:
+        return [], 0.0
 
     started = time.perf_counter()
+    detections: list[tuple[int, tuple[int, int, int, int], float]] = []
     try:
-        result = PPE_MODEL(frame, conf=PPE_CONFIDENCE_THRESHOLD, verbose=False)[0]
+        for person_box in person_boxes:
+            crop_box = _upper_body_box(person_box, frame.shape)
+            crop = _safe_crop(frame, *crop_box)
+            if crop is None or crop.size == 0:
+                continue
+            result = PPE_MODEL(crop, conf=PPE_CONFIDENCE_THRESHOLD, verbose=False)[0]
+            if result.boxes is None:
+                continue
+            crop_x1, crop_y1, _, _ = crop_box
+            for box in result.boxes:
+                cls_id = int(box.cls[0])
+                x1, y1, x2, y2 = map(int, box.xyxy[0])
+                conf = float(box.conf[0]) if box.conf is not None else 0.0
+                detections.append(
+                    (
+                        cls_id,
+                        (x1 + crop_x1, y1 + crop_y1, x2 + crop_x1, y2 + crop_y1),
+                        conf,
+                    )
+                )
     except Exception:
-        return None
+        return None, (time.perf_counter() - started) * 1000.0
     finally:
         _monitor_inference_time("ppe_detection", time.perf_counter() - started, "PPE_MODEL")
 
-    detections: list[tuple[int, tuple[int, int, int, int], float]] = []
-    if result.boxes is None:
-        return detections
-
-    for box in result.boxes:
-        cls_id = int(box.cls[0])
-        x1, y1, x2, y2 = map(int, box.xyxy[0])
-        conf = float(box.conf[0]) if box.conf is not None else 0.0
-        detections.append((cls_id, (x1, y1, x2, y2), conf))
-    return detections
+    return detections, (time.perf_counter() - started) * 1000.0
 
 
 def _select_track_for_ppe_detection(
@@ -1225,6 +1282,25 @@ def _violation_confidence(missing_items: list[str], item_conf: dict[str, float])
     return round(sum(confidences) / max(len(confidences), 1), 4)
 
 
+def _unknown_ppe_status() -> dict[str, Optional[bool]]:
+    return {item: None for item in PPE_ITEMS}
+
+
+def _update_runtime_averages(job: SourceJob, person_inference_ms: float, ppe_inference_ms: float) -> None:
+    samples = job.runtime_samples + 1
+    job.runtime_samples = samples
+    job.last_person_inference_ms = round(person_inference_ms, 2)
+    job.last_ppe_inference_ms = round(ppe_inference_ms, 2)
+    job.average_person_inference_ms = round(
+        ((job.average_person_inference_ms * (samples - 1)) + person_inference_ms) / samples,
+        2,
+    )
+    job.average_ppe_inference_ms = round(
+        ((job.average_ppe_inference_ms * (samples - 1)) + ppe_inference_ms) / samples,
+        2,
+    )
+
+
 def _cleanup_stale_state(job: SourceJob, frame_number: int, active_track_ids: set[int]) -> None:
     stale_track_ids = [
         track_id
@@ -1362,6 +1438,150 @@ def get_recent_violations(limit: int = 100, job_id: Optional[str] = None) -> lis
     return [_violation_from_row(row) for row in rows]
 
 
+def _process_frame(job: SourceJob, frame, record_violations: bool = True) -> dict[str, Any]:
+    frame_started_at = time.perf_counter()
+
+    with job.lock:
+        job.frame_count += 1
+        frame_number = job.frame_count
+
+    person_boxes, person_inference_ms = _run_person_detection(frame)
+    detections = [
+        ([x1, y1, x2 - x1, y2 - y1], 0.9, "person")
+        for (x1, y1, x2, y2) in person_boxes
+    ]
+    embeds = _build_embeddings(frame, detections)
+    tracks = job.tracker.update_tracks(detections, embeds=embeds)
+
+    ppe_detections, ppe_inference_ms = _run_ppe_detection(frame, person_boxes)
+    ppe_inference_ok = ppe_detections is not None
+
+    confirmed_track_boxes: dict[int, tuple[int, int, int, int]] = {}
+    for track in tracks:
+        if not track.is_confirmed():
+            continue
+        track_id = int(track.track_id)
+        confirmed_track_boxes[track_id] = tuple(map(int, track.to_ltrb()))
+
+    evidence_from_ppe = {}
+    if ppe_inference_ok:
+        evidence_from_ppe = _associate_ppe_to_tracks(confirmed_track_boxes, ppe_detections or [])
+
+    detected_people = len(person_boxes)
+    active_tracks = 0
+    violating_tracks = 0
+    active_track_ids: set[int] = set()
+    now_ts = time.time()
+    recorded_violation_count = 0
+
+    for track_id, (x1, y1, x2, y2) in confirmed_track_boxes.items():
+        active_tracks += 1
+        active_track_ids.add(track_id)
+        track_state = job.track_cache.get(track_id)
+        if track_state is None:
+            track_state = _new_track_state(frame_number)
+
+        should_refresh = frame_number - int(track_state.get("last_frame", 0)) >= PPE_REFRESH_FRAMES
+
+        frame_evidence = _empty_frame_evidence()
+        if should_refresh and ppe_inference_ok:
+            frame_evidence = evidence_from_ppe.get(track_id, _empty_frame_evidence())
+        smoothed_status, smoothed_confidence = _apply_temporal_filter(track_state, frame_evidence)
+        worker_id = _update_worker_id(track_state, (x1, y1, x2, y2), now_ts, job.source)
+
+        track_state["last_frame"] = frame_number
+        job.track_cache[track_id] = track_state
+
+        if ppe_inference_ok:
+            ppe_status: dict[str, Optional[bool]] = smoothed_status
+            ppe_confidence = smoothed_confidence
+            missing_items = [item for item, present in ppe_status.items() if present is False]
+        else:
+            ppe_status = _unknown_ppe_status()
+            ppe_confidence = {item: 0.0 for item in PPE_ITEMS}
+            missing_items = []
+
+        is_violation = bool(missing_items)
+        if is_violation:
+            violating_tracks += 1
+
+        box_color = (0, 0, 255) if is_violation else (0, 200, 0)
+        cv2.rectangle(frame, (x1, y1), (x2, y2), box_color, 2)
+        cv2.putText(
+            frame,
+            f"ID {track_id}",
+            (x1, max(20, y1 - 8)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            box_color,
+            2,
+        )
+
+        text_y = y1 + 20
+        for item in PPE_ITEMS:
+            present = ppe_status[item]
+            if present is None:
+                label = "UNK"
+                color = (148, 163, 184)
+            else:
+                label = "OK" if present else "NO"
+                color = (0, 200, 0) if present else (0, 0, 255)
+            cv2.putText(
+                frame,
+                f"{item.upper()}: {label}",
+                (x1, text_y),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                color,
+                2,
+            )
+            text_y += 18
+
+        if record_violations and is_violation:
+            fingerprint = _build_violation_fingerprint(job.source, worker_id, missing_items)
+            now = time.time()
+            last_time = job.last_violation_by_key.get(fingerprint, 0.0)
+            if now - last_time >= VIOLATION_DEDUP_SECONDS:
+                job.last_violation_by_key[fingerprint] = now
+                recorded_violation_count += 1
+                write_violation(
+                    job=job,
+                    track_id=track_id,
+                    worker_id=worker_id,
+                    missing_items=missing_items,
+                    ppe_status={item: bool(value) for item, value in ppe_status.items() if value is not None},
+                    confidence=_violation_confidence(missing_items, ppe_confidence),
+                )
+
+    _cleanup_stale_state(job, frame_number, active_track_ids)
+
+    elapsed = max(time.perf_counter() - frame_started_at, 1e-6)
+    fps_value = round(1.0 / elapsed, 2)
+    if FPS_OVERLAY_ENABLED:
+        cv2.putText(
+            frame,
+            f"FPS: {fps_value}",
+            (12, 28),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (255, 230, 0),
+            2,
+        )
+
+    return {
+        "frame": frame,
+        "frame_time": datetime.datetime.now(datetime.UTC).isoformat(),
+        "people_detected": detected_people,
+        "active_tracks": active_tracks,
+        "violating_tracks": violating_tracks,
+        "fps": fps_value,
+        "person_inference_ms": round(person_inference_ms, 2),
+        "ppe_inference_ms": round(ppe_inference_ms, 2),
+        "ppe_inference_ok": ppe_inference_ok,
+        "recorded_violations": recorded_violation_count,
+    }
+
+
 def _job_worker(job: SourceJob) -> None:
     capture, actual_source, actual_path, open_error = _open_capture_for_job(job)
     with job.condition:
@@ -1389,139 +1609,26 @@ def _job_worker(job: SourceJob) -> None:
                 time.sleep(0.05)
                 continue
 
-            with job.lock:
-                job.frame_count += 1
-                frame_number = job.frame_count
+            frame_result = _process_frame(job, frame, record_violations=True)
 
-            person_boxes = _run_person_detection(frame)
-            detections = [
-                ([x1, y1, x2 - x1, y2 - y1], 0.9, "person")
-                for (x1, y1, x2, y2) in person_boxes
-            ]
-            embeds = _build_embeddings(frame, detections)
-            tracks = job.tracker.update_tracks(detections, embeds=embeds)
-
-            ppe_detections = _run_ppe_detection(frame)
-            ppe_inference_ok = ppe_detections is not None
-
-            confirmed_track_boxes: dict[int, tuple[int, int, int, int]] = {}
-            for track in tracks:
-                if not track.is_confirmed():
-                    continue
-                track_id = int(track.track_id)
-                confirmed_track_boxes[track_id] = tuple(map(int, track.to_ltrb()))
-
-            evidence_from_ppe = {}
-            if ppe_inference_ok:
-                evidence_from_ppe = _associate_ppe_to_tracks(confirmed_track_boxes, ppe_detections or [])
-
-            detected_people = len(person_boxes)
-            active_tracks = 0
-            violating_tracks = 0
-            active_track_ids: set[int] = set()
-            now_ts = time.time()
-
-            for track_id, (x1, y1, x2, y2) in confirmed_track_boxes.items():
-                active_tracks += 1
-                active_track_ids.add(track_id)
-                track_state = job.track_cache.get(track_id)
-                if track_state is None:
-                    track_state = _new_track_state(frame_number)
-
-                should_refresh = frame_number - int(track_state.get("last_frame", 0)) >= PPE_REFRESH_FRAMES
-
-                frame_evidence = _empty_frame_evidence()
-                if should_refresh and ppe_inference_ok:
-                    frame_evidence = evidence_from_ppe.get(track_id, _empty_frame_evidence())
-                smoothed_status, smoothed_confidence = _apply_temporal_filter(track_state, frame_evidence)
-                worker_id = _update_worker_id(track_state, (x1, y1, x2, y2), now_ts, job.source)
-
-                track_state["last_frame"] = frame_number
-                job.track_cache[track_id] = track_state
-
-                if ppe_inference_ok:
-                    ppe_status = smoothed_status
-                    ppe_confidence = smoothed_confidence
-                else:
-                    ppe_status = dict(track_state.get("status", {item: False for item in PPE_ITEMS}))
-                    ppe_confidence = dict(track_state.get("confidence", {item: 0.0 for item in PPE_ITEMS}))
-
-                missing_items = [item for item, present in ppe_status.items() if not present]
-                is_violation = bool(missing_items)
-                if is_violation:
-                    violating_tracks += 1
-
-                box_color = (0, 0, 255) if is_violation else (0, 200, 0)
-                cv2.rectangle(frame, (x1, y1), (x2, y2), box_color, 2)
-                cv2.putText(
-                    frame,
-                    f"ID {track_id}",
-                    (x1, max(20, y1 - 8)),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.6,
-                    box_color,
-                    2,
-                )
-
-                text_y = y1 + 20
-                for item in PPE_ITEMS:
-                    present = ppe_status[item]
-                    color = (0, 200, 0) if present else (0, 0, 255)
-                    cv2.putText(
-                        frame,
-                        f"{item.upper()}: {'OK' if present else 'NO'}",
-                        (x1, text_y),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.5,
-                        color,
-                        2,
-                    )
-                    text_y += 18
-
-                if is_violation:
-                    fingerprint = _build_violation_fingerprint(job.source, worker_id, missing_items)
-                    now = time.time()
-                    last_time = job.last_violation_by_key.get(fingerprint, 0.0)
-                    if now - last_time >= VIOLATION_DEDUP_SECONDS:
-                        job.last_violation_by_key[fingerprint] = now
-                        write_violation(
-                            job=job,
-                            track_id=track_id,
-                            worker_id=worker_id,
-                            missing_items=missing_items,
-                            ppe_status=ppe_status,
-                            confidence=_violation_confidence(missing_items, ppe_confidence),
-                        )
-
-            _cleanup_stale_state(job, frame_number, active_track_ids)
-
-            elapsed = max(time.perf_counter() - frame_started_at, 1e-6)
-            fps_value = round(1.0 / elapsed, 2)
-            if FPS_OVERLAY_ENABLED:
-                cv2.putText(
-                    frame,
-                    f"FPS: {fps_value}",
-                    (12, 28),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.7,
-                    (255, 230, 0),
-                    2,
-                )
-
-            ok, buffer = cv2.imencode(".jpg", frame)
+            ok, buffer = cv2.imencode(".jpg", frame_result["frame"])
             if not ok:
                 continue
 
             with job.condition:
-                job.people_detected = detected_people
-                job.active_tracks = active_tracks
-                job.violating_tracks = violating_tracks
-                job.fps = fps_value
-                job.latest_frame_time = datetime.datetime.now(datetime.UTC).isoformat()
+                job.people_detected = int(frame_result["people_detected"])
+                job.active_tracks = int(frame_result["active_tracks"])
+                job.violating_tracks = int(frame_result["violating_tracks"])
+                job.fps = float(frame_result["fps"])
+                job.latest_frame_time = str(frame_result["frame_time"])
+                _update_runtime_averages(
+                    job,
+                    float(frame_result["person_inference_ms"]),
+                    float(frame_result["ppe_inference_ms"]),
+                )
                 job.latest_frame_jpeg = buffer.tobytes()
                 job.latest_frame_seq += 1
                 job.condition.notify_all()
-
             _apply_frame_rate_limit(frame_started_at)
     finally:
         capture.release()

@@ -72,3 +72,18 @@ Use a production WSGI server instead of `python app.py`:
 ```bash
 gunicorn --bind 0.0.0.0:8000 wsgi:application
 ```
+
+## Phase 5 Verification
+Phase 5 moves PPE detection onto person upper-body crops and adds repeatable runtime
+and regression checks. When the PPE model is invalid or disabled, the app now shows
+an unknown PPE state instead of generating false violations.
+
+Runtime benchmark:
+```bash
+./venv/bin/python scripts/benchmark_runtime.py --video videos/test-video.mp4 --frames 120 --warmup 5
+```
+
+Regression evaluation:
+```bash
+./venv/bin/python scripts/evaluate_regression.py --video videos/test-video.mp4 --expected evaluation/test-video.expected.json
+```

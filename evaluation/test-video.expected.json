@@ -1,0 +1,26 @@
+{
+  "name": "test-video-no-false-violations",
+  "notes": "Regression sample for current fallback state. When the PPE model is invalid or disabled, the pipeline must not emit false violations.",
+  "frames": [
+    {
+      "frame": 1,
+      "violating_tracks": 0
+    },
+    {
+      "frame": 15,
+      "violating_tracks": 0
+    },
+    {
+      "frame": 30,
+      "violating_tracks": 0
+    },
+    {
+      "frame": 45,
+      "violating_tracks": 0
+    },
+    {
+      "frame": 60,
+      "violating_tracks": 0
+    }
+  ]
+}
