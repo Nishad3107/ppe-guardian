@@ -87,3 +87,20 @@ Regression evaluation:
 ```bash
 ./venv/bin/python scripts/evaluate_regression.py --video videos/test-video.mp4 --expected evaluation/test-video.expected.json
 ```
+
+## Phase 6 Tests And CI
+Run the local test suite:
+```bash
+npm test
+```
+
+Run syntax and config checks:
+```bash
+npm run check
+npm run validate:config
+```
+
+If you want config validation to fail on a bad PPE model too:
+```bash
+python scripts/validate_runtime_config.py --require-valid-ppe-model
+```

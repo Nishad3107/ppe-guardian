@@ -4,6 +4,9 @@
   "version": "1.0.0",
   "description": "Dev launcher for the PPE Guardian Flask app",
   "scripts": {
-    "dev": "node scripts/dev.js"
+    "dev": "node scripts/dev.js",
+    "test": "node scripts/run-python.js -m unittest tests.test_app",
+    "check": "node scripts/run-python.js -m py_compile app.py wsgi.py scripts/benchmark_runtime.py scripts/evaluate_regression.py scripts/merge_ppe_datasets.py scripts/ppe_dataset_forensics.py scripts/ppe_pipeline_common.py scripts/train_ppe_model.py scripts/validate_ppe_dataset.py scripts/validate_runtime_config.py scripts/verify_and_deploy_ppe_model.py tests/test_app.py",
+    "validate:config": "node scripts/run-python.js scripts/validate_runtime_config.py"
   }
 }

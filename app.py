@@ -11,6 +11,7 @@ import sqlite3
 import threading
 import time
 from collections import deque
+from contextlib import closing
 from dataclasses import dataclass, field
 from functools import wraps
 from pathlib import Path
@@ -373,7 +374,7 @@ def _db_connection() -> sqlite3.Connection:
 
 def init_database() -> None:
     with DB_LOCK:
-        with _db_connection() as conn:
+        with closing(_db_connection()) as conn:
             conn.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS violations (
@@ -420,7 +421,7 @@ def init_database() -> None:
 
 def _count_existing_log_entries() -> int:
     with DB_LOCK:
-        with _db_connection() as conn:
+        with closing(_db_connection()) as conn:
             row = conn.execute("SELECT COUNT(*) AS count FROM violations").fetchone()
     return int(row["count"]) if row is not None else 0
 
@@ -432,7 +433,7 @@ def _record_upload(job_id: str, original_filename: str, stored_path: str) -> Non
     uploaded_at = datetime.datetime.now(datetime.UTC)
     expires_at = uploaded_at + datetime.timedelta(days=UPLOAD_RETENTION_DAYS)
     with DB_LOCK:
-        with _db_connection() as conn:
+        with closing(_db_connection()) as conn:
             conn.execute(
                 """
                 INSERT INTO uploads (job_id, original_filename, stored_path, uploaded_at, expires_at, source_status)
@@ -451,7 +452,7 @@ def _record_upload(job_id: str, original_filename: str, stored_path: str) -> Non
 
 def _update_upload_status(job_id: str, source_status: str) -> None:
     with DB_LOCK:
-        with _db_connection() as conn:
+        with closing(_db_connection()) as conn:
             conn.execute(
                 "UPDATE uploads SET source_status = ? WHERE job_id = ?",
                 (source_status, job_id),
@@ -460,7 +461,7 @@ def _update_upload_status(job_id: str, source_status: str) -> None:
 
 def _database_health_snapshot() -> dict[str, Any]:
     with DB_LOCK:
-        with _db_connection() as conn:
+        with closing(_db_connection()) as conn:
             violation_count = conn.execute("SELECT COUNT(*) AS count FROM violations").fetchone()["count"]
             upload_count = conn.execute("SELECT COUNT(*) AS count FROM uploads").fetchone()["count"]
     return {
@@ -484,7 +485,7 @@ def cleanup_expired_uploads(force: bool = False) -> int:
             return 0
         cutoff = datetime.datetime.now(datetime.UTC).isoformat()
         with DB_LOCK:
-            with _db_connection() as conn:
+            with closing(_db_connection()) as conn:
                 rows = conn.execute(
                     """
                     SELECT id, stored_path FROM uploads
@@ -610,6 +611,44 @@ def _is_allowed_video_upload(uploaded) -> bool:
         return True
     # Some browsers omit a useful mime type, so allow known video extensions.
     return bool(suffix)
+
+
+def _path_reference_kind(path: Path) -> str:
+    if path.exists():
+        return "file"
+    if not path.is_absolute() and len(path.parts) == 1 and path.suffix.lower() in {".pt", ".pth"}:
+        return "alias"
+    return "missing"
+
+
+def build_startup_checklist() -> dict[str, Any]:
+    person_kind = _path_reference_kind(PERSON_MODEL_PATH)
+    ppe_kind = _path_reference_kind(PPE_MODEL_PATH)
+    recorded_exists = RECORDED_VIDEO_PATH.exists()
+
+    checks = {
+        "person_model": {
+            "path": str(PERSON_MODEL_PATH),
+            "reference_kind": person_kind,
+            "exists": PERSON_MODEL_PATH.exists(),
+            "ok": person_kind in {"file", "alias"},
+        },
+        "ppe_model": {
+            "path": str(PPE_MODEL_PATH),
+            "reference_kind": ppe_kind,
+            "exists": PPE_MODEL_PATH.exists(),
+            "ok": PPE_MODEL_PATH.exists(),
+        },
+        "recorded_video": {
+            "path": str(RECORDED_VIDEO_PATH),
+            "exists": recorded_exists,
+            "ok": recorded_exists,
+        },
+    }
+    return {
+        "ok": all(item["ok"] for item in checks.values()),
+        "checks": checks,
+    }
 
 
 def run_startup_validation(fail_on_error: bool = False) -> dict[str, Any]:
@@ -1352,7 +1391,7 @@ def write_violation(
     }
 
     with DB_LOCK:
-        with _db_connection() as conn:
+        with closing(_db_connection()) as conn:
             conn.execute(
                 """
                 INSERT INTO violations (
@@ -1433,7 +1472,7 @@ def get_recent_violations(limit: int = 100, job_id: Optional[str] = None) -> lis
     params.append(limit)
 
     with DB_LOCK:
-        with _db_connection() as conn:
+        with closing(_db_connection()) as conn:
             rows = conn.execute(query, params).fetchall()
     return [_violation_from_row(row) for row in rows]
 
@@ -1838,6 +1877,7 @@ def api_health():
                 "auth_required": _auth_enabled(),
                 "max_upload_size_mb": MAX_UPLOAD_SIZE_MB,
             },
+            "startup": build_startup_checklist(),
             "operations": {
                 "cleanup_run_removed_uploads": cleaned_uploads,
                 "upload_retention_days": UPLOAD_RETENTION_DAYS,
