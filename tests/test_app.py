@@ -208,6 +208,24 @@ class AppModuleTestCase(unittest.TestCase):
         self.assertEqual(payload["people_detected"], 3)
         self.assertEqual(payload["active_tracks"], 2)
 
+    def test_stop_job_route_stops_job(self):
+        client = self.app_module.app.test_client()
+        job = self.app_module._create_job("camera", "CAMERA", "0")
+        job.source = "CAMERA"
+        job.source_ready = True
+        with self.app_module.JOBS_LOCK:
+            self.app_module.JOBS[job.job_id] = job
+            self.app_module.ACTIVE_JOB_ID = job.job_id
+
+        self.assertFalse(job.stop_event.is_set())
+        response = client.post(f"/api/jobs/{job.job_id}/stop")
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(job.stop_event.is_set())
+
+        with self.app_module.JOBS_LOCK:
+            self.assertNotIn(job.job_id, self.app_module.JOBS)
+            self.assertEqual(self.app_module.ACTIVE_JOB_ID, "")
+
     def test_violation_row_parsing_tolerates_invalid_json(self):
         parsed = self.app_module._violation_from_row(
             {

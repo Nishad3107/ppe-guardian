@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import subprocess
+import sys
 from pathlib import Path
 
 from ppe_pipeline_common import (
@@ -49,8 +50,14 @@ def main() -> int:
     data_yaml = write_data_yaml(args.dataset_root)
     print(f"Using data config: {data_yaml}")
 
+    python_dir = Path(sys.executable).parent
+    yolo_candidate = python_dir / "yolo"
+    if not yolo_candidate.exists():
+        yolo_candidate = python_dir / "yolo.exe"
+    yolo_cmd = str(yolo_candidate) if yolo_candidate.exists() else "yolo"
+
     command = [
-        "yolo",
+        yolo_cmd,
         "detect",
         "train",
         f"model={args.model}",

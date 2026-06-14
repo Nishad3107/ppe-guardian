@@ -1,9 +1,0 @@
-path: /Users/nishadtembhurnekar/Desktop/Marketwise/ppe-guardian/datasets/ppe_final_tmp_merge
-train: images/train
-val: images/val
-nc: 4
-names:
-  0: helmet
-  1: mask
-  2: glasses
-  3: boots

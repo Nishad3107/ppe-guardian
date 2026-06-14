@@ -1838,6 +1838,25 @@ def dashboard():
     )
 
 
+@app.route("/api/jobs/<job_id>/stop", methods=["POST"])
+def stop_job(job_id: str):
+    if _auth_enabled() and not _is_authenticated():
+        return jsonify({"error": "Unauthorized"}), 401
+
+    job = _resolve_job(job_id)
+    if job is not None:
+        job.stop_event.set()
+        if job.thread:
+            job.thread.join(timeout=1.0)
+        with JOBS_LOCK:
+            JOBS.pop(job_id, None)
+            global ACTIVE_JOB_ID
+            if ACTIVE_JOB_ID == job_id:
+                ACTIVE_JOB_ID = ""
+        return jsonify({"status": "stopped", "job_id": job_id})
+    return jsonify({"error": "Job not found"}), 404
+
+
 @app.route("/api/metrics")
 def api_metrics():
     job_id = request.args.get("job_id")

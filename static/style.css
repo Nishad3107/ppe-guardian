@@ -148,6 +148,15 @@ body {
   background: #eaf2ff;
 }
 
+.btn-danger {
+  background: var(--danger);
+  color: #ffffff;
+}
+
+.btn-danger:hover {
+  background: #b91c1c;
+}
+
 .panel {
   background: var(--surface);
   border: 1px solid var(--line);
